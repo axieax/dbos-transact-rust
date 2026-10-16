@@ -254,8 +254,10 @@ pub enum Error<E = EngineOnly> {
 
     /// A row is tagged with an encoding this process cannot read.
     ///
-    /// `rust_serde` and `portable_json` are always readable. Any other tag is another SDK's
-    /// native encoding, and a value in it is reported rather than guessed at.
+    /// `rust_serde` and `portable_json` are always readable, and so is the configured
+    /// [`CustomSerializer`](crate::CustomSerializer)'s name. Any other tag is another SDK's
+    /// native encoding, or a custom serializer this process is not configured with, and a value
+    /// in it is reported rather than guessed at.
     #[error("serialization {name} is not available")]
     UnknownSerialization {
         /// The tag the row carries.
@@ -737,9 +739,9 @@ pub(crate) enum Failure {
 
 /// A workflow's error as its row holds it, with the encoding that says how to read it.
 ///
-/// **The encoding travels with the bytes** because the formats encode an error differently — the
-/// whole [`Error`] natively, a `{name, message, code, data}` envelope portably — and a reader
-/// that guessed would read one as the other.
+/// **The encoding travels with the bytes** because the encodings write an error differently — the
+/// whole [`Error`] natively or in a custom serializer, a `{name, message, code, data}` envelope
+/// portably — and a reader that guessed would read one as the other.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedError {
     /// The encoded error.
@@ -753,7 +755,8 @@ impl EncodedError {
     ///
     /// An error that does not decode — a native one some other build wrote in a shape this one
     /// cannot read — is reported as [`Error::WorkflowFailed`] with the bytes as its message, which
-    /// is what survives.
+    /// is what survives. One a custom serializer cannot decode is [`Error::Deserialization`]: its
+    /// bytes are no message.
     pub(crate) fn decode<E: DurableError>(&self, workflow_id: &str) -> Error<E> {
         decode_error(&self.encoded, &self.encoding).unwrap_or_else(|| Error::WorkflowFailed {
             workflow_id: workflow_id.to_owned(),

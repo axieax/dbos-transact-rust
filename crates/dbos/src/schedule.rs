@@ -60,7 +60,9 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
 use crate::registry::{Snapshot, WorkflowKey, WorkflowRef};
-use crate::serialization::{PayloadEncoding, SerializationFormat, decode, encode, encode_input};
+use crate::serialization::{
+    PayloadEncoding, SerializationFormat, Serializer, decode, encode, encode_input,
+};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     Change, NewSchedule, NewWorkflow, ScheduleFilter, ScheduleRecord, ScheduleStatus,
@@ -74,15 +76,23 @@ use crate::workflow::{DuplicationPolicy, Enqueue, init_or_join, new_row};
 /// A struct because a workflow takes one argument. Encoded as `{"scheduled_time": <RFC 3339 text>,
 /// "context": <the stored context>}`.
 ///
+/// **The context travels as JSON data**, in whatever format carries the input: it is turned into a
+/// `serde_json::Value` on the way in and read back from one, as a schedule's stored context is. A
+/// type that serializes differently in a format that is not human-readable — an IP address, a UUID
+/// — therefore reads back the same through a binary [`CustomSerializer`](crate::CustomSerializer)
+/// as through JSON.
+///
 /// `scheduled_time` is the **tick**, not the moment the workflow started: a workflow that waited
 /// in a queue, or one enqueued by a backfill, still reports the time it was scheduled for. A
 /// manual [`trigger`](DBOS::trigger_schedule) reports the time it was triggered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound(serialize = "C: Serialize", deserialize = "C: DeserializeOwned"))]
 pub struct ScheduledWorkflowInput<C = ()> {
     /// The cron tick this run is for.
     #[serde(with = "rfc3339")]
     pub scheduled_time: SystemTime,
-    /// The schedule's context, as [`ScheduleSpec`] stored it.
+    /// The schedule's context.
+    #[serde(with = "json_data")]
     pub context: C,
 }
 
@@ -111,11 +121,40 @@ mod rfc3339 {
     }
 }
 
+/// A context as the JSON data it is stored as, whatever format carries it.
+///
+/// The stored context is a `serde_json::Value`, which a format that is not human-readable carries
+/// as JSON data: an `Ipv4Addr` stored as `"10.0.0.1"` stays a string in CBOR. Reading `C` straight
+/// from such a format would expect `C`'s binary form — four octets — and fail, so `C` is read from
+/// the JSON data instead, and written as it, so that both directions agree.
+mod json_data {
+    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
+
+    pub(super) fn serialize<C: Serialize, S: Serializer>(
+        context: &C,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde_json::to_value(context)
+            .map_err(ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, C: DeserializeOwned, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<C, D::Error> {
+        serde_json::from_value(serde_json::Value::deserialize(deserializer)?)
+            .map_err(de::Error::custom)
+    }
+}
+
 /// A schedule's definition: what [`create_schedule`](DBOS::create_schedule) creates and
 /// [`apply_schedules`](DBOS::apply_schedules) reconciles.
 ///
-/// The context is encoded when the spec is built, so a spec that exists is one whose context could
-/// be written; the rest are plain fields to set after construction.
+/// The context is turned into a JSON value when the spec is built, so a spec that exists is one
+/// whose context could be written. It is encoded with the configured
+/// [`Serializer`](crate::Serializer) when the spec is written. The rest are plain fields to set
+/// after construction.
 ///
 /// # The cron dialect
 ///
@@ -157,8 +196,8 @@ pub struct ScheduleSpec {
     ///
     /// A configured instance cannot be scheduled: the table has no column for one.
     pub workflow: WorkflowKey,
-    /// The context each tick is called with, encoded.
-    context: String,
+    /// The context each tick is called with.
+    context: serde_json::Value,
     /// Whether an executor picking the schedule up — after a restart, or a deploy — first enqueues
     /// the ticks missed since it last fired.
     pub automatic_backfill: bool,
@@ -208,7 +247,8 @@ impl ScheduleSpec {
             schedule_name: schedule_name.into(),
             schedule: schedule.into(),
             workflow,
-            context: encode(context, &PayloadEncoding::Native, "schedule context")?,
+            context: serde_json::to_value(context)
+                .map_err(|source| Error::encode_failed("schedule context", source))?,
             automatic_backfill: false,
             cron_timezone: None,
             queue_name: None,
@@ -216,8 +256,8 @@ impl ScheduleSpec {
         })
     }
 
-    /// The context, encoded as the row stores it.
-    pub fn context(&self) -> &str {
+    /// The context each tick is called with.
+    pub fn context(&self) -> &serde_json::Value {
         &self.context
     }
 
@@ -244,11 +284,17 @@ impl ScheduleSpec {
         Ok(())
     }
 
-    /// The row this spec writes. `schedule_id` is generated by the system database.
-    fn as_new(&self) -> NewSchedule<'_> {
+    /// The context, encoded with `configured` as the row stores it.
+    fn encode_context(&self, configured: &Serializer) -> Result<String> {
+        encode(&self.context, &configured.encoding(), "schedule context")
+    }
+
+    /// The row this spec writes, with its context already encoded. `schedule_id` is generated by
+    /// the system database.
+    fn as_new<'a>(&'a self, context: &'a str) -> NewSchedule<'a> {
         NewSchedule {
             workflow_class_name: self.workflow.class_name.as_deref(),
-            context: &self.context,
+            context,
             automatic_backfill: self.automatic_backfill,
             cron_timezone: self.cron_timezone.as_deref(),
             queue_name: self.queue_name.as_deref(),
@@ -281,12 +327,11 @@ pub struct ScheduleChange<'a> {
 }
 
 impl ScheduleChange<'_> {
-    /// Refuses a change that would leave a schedule no executor could fire, and encodes the
-    /// context.
+    /// Refuses a change that would leave a schedule no executor could fire.
     ///
     /// **A new expression is checked against the new timezone or UTC**, not the stored one: the
     /// stored row is not read, and an expression that fires somewhere fires everywhere.
-    fn validate(&self, name: &str, operation: &'static str) -> Result<Option<String>> {
+    fn validate(&self, name: &str, operation: &'static str) -> Result<()> {
         let refuse = |detail: String| Error::InvalidArgument {
             operation: operation.into(),
             detail: format!("schedule `{name}`: {detail}"),
@@ -304,10 +349,15 @@ impl ScheduleChange<'_> {
             }
             Change::Leave => {}
         }
+        Ok(())
+    }
+
+    /// The new context, encoded with `configured` as the row stores it, or `None` to leave it.
+    fn encode_context(&self, configured: &Serializer) -> Result<Option<String>> {
         match &self.context {
             Change::Set(context) => Ok(Some(encode(
                 context,
-                &PayloadEncoding::Native,
+                &configured.encoding(),
                 "schedule context",
             )?)),
             Change::Leave => Ok(None),
@@ -322,9 +372,9 @@ impl ScheduleChange<'_> {
 /// it is paused, and when it last fired.
 ///
 /// The context is kept encoded, and [`decode_context`](Self::decode_context) decodes it on request:
-/// a schedule written by another SDK may hold a context this one cannot read, and listing it should
-/// not fail for that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// a schedule written by another SDK, or under another serializer, may hold a context this one
+/// cannot read, and listing it should not fail for that.
+#[derive(Debug, Clone)]
 pub struct Schedule {
     id: String,
     name: String,
@@ -332,6 +382,8 @@ pub struct Schedule {
     schedule: String,
     status: ScheduleStatus,
     context: String,
+    /// What reads the context: the serializer of the handle that read the row.
+    serializer: Serializer,
     last_fired_at: Option<SystemTime>,
     automatic_backfill: bool,
     cron_timezone: Option<String>,
@@ -339,9 +391,43 @@ pub struct Schedule {
     application_name: Option<String>,
 }
 
+/// Two views are equal when they read the same row: which serializer reads the context is not
+/// part of the schedule.
+impl PartialEq for Schedule {
+    fn eq(&self, other: &Self) -> bool {
+        let Schedule {
+            id,
+            name,
+            workflow,
+            schedule,
+            status,
+            context,
+            serializer: _,
+            last_fired_at,
+            automatic_backfill,
+            cron_timezone,
+            queue_name,
+            application_name,
+        } = self;
+        *id == other.id
+            && *name == other.name
+            && *workflow == other.workflow
+            && *schedule == other.schedule
+            && *status == other.status
+            && *context == other.context
+            && *last_fired_at == other.last_fired_at
+            && *automatic_backfill == other.automatic_backfill
+            && *cron_timezone == other.cron_timezone
+            && *queue_name == other.queue_name
+            && *application_name == other.application_name
+    }
+}
+
+impl Eq for Schedule {}
+
 impl Schedule {
-    /// Builds the read view from a row.
-    pub(crate) fn from_record(record: ScheduleRecord) -> Self {
+    /// Builds the read view from a row, read by a handle configured with `serializer`.
+    pub(crate) fn from_record(record: ScheduleRecord, serializer: &Serializer) -> Self {
         Self {
             workflow: WorkflowKey::from_row(
                 record.workflow_name,
@@ -353,6 +439,7 @@ impl Schedule {
             schedule: record.schedule,
             status: record.status,
             context: record.context,
+            serializer: serializer.clone(),
             // A `Timestamp` the clock cannot represent is not one a schedule fired at.
             last_fired_at: record.last_fired_at.and_then(Timestamp::to_system_time),
             automatic_backfill: record.automatic_backfill,
@@ -394,12 +481,13 @@ impl Schedule {
     }
 
     /// The context each tick is called with, decoded as `C`.
+    ///
+    /// Read with the configured [`Serializer`](crate::Serializer). The column carries no tag, so
+    /// a context written under another serializer — including one written before a
+    /// [`CustomSerializer`](crate::CustomSerializer) was configured — is read as if this one had
+    /// written it: it fails to decode, or decodes to something else.
     pub fn decode_context<C: DeserializeOwned>(&self) -> Result<C> {
-        decode(
-            Some(&self.context),
-            &PayloadEncoding::Native,
-            "schedule context",
-        )
+        decode_context(&self.context, &self.serializer)
     }
 
     /// The tick the schedule last fired for, or `None` if it has not fired.
@@ -532,7 +620,11 @@ impl DBOS {
                     .connection()
                     .list_schedules(filter, placement.step())
                     .await?;
-                Ok(records.into_iter().map(Schedule::from_record).collect())
+                let serializer = executor.serializer();
+                Ok(records
+                    .into_iter()
+                    .map(|record| Schedule::from_record(record, serializer))
+                    .collect())
             },
         )
     }
@@ -547,7 +639,7 @@ impl DBOS {
                     .connection()
                     .get_schedule(name, placement.step())
                     .await?;
-                Ok(record.map(Schedule::from_record))
+                Ok(record.map(|record| Schedule::from_record(record, executor.serializer())))
             },
         )
     }
@@ -564,7 +656,8 @@ impl DBOS {
     ) -> PendingStep<'a, ()> {
         const OPERATION: &str = "update a schedule";
         let built = self.executor(OPERATION).and_then(|executor| {
-            let context = change.validate(name, OPERATION)?;
+            change.validate(name, OPERATION)?;
+            let context = change.encode_context(executor.serializer())?;
             let placement = StepPlacement::of(executor.connection(), OPERATION)?;
             Ok(((executor, context), placement))
         });
@@ -743,19 +836,25 @@ impl Client {
 
     /// The schedules matching `filter`. See [`DBOS::list_schedules`].
     pub async fn list_schedules(&self, filter: &ScheduleFilter<'_>) -> Result<Vec<Schedule>> {
-        let records = self.connection().list_schedules(filter, None).await?;
-        Ok(records.into_iter().map(Schedule::from_record).collect())
+        let conn = self.connection();
+        let records = conn.list_schedules(filter, None).await?;
+        Ok(records
+            .into_iter()
+            .map(|record| Schedule::from_record(record, conn.serializer()))
+            .collect())
     }
 
     /// The schedule with this name, or `None`.
     pub async fn get_schedule(&self, name: &str) -> Result<Option<Schedule>> {
-        let record = self.connection().get_schedule(name, None).await?;
-        Ok(record.map(Schedule::from_record))
+        let conn = self.connection();
+        let record = conn.get_schedule(name, None).await?;
+        Ok(record.map(|record| Schedule::from_record(record, conn.serializer())))
     }
 
     /// Changes a schedule's definition. See [`DBOS::update_schedule`].
     pub async fn update_schedule(&self, name: &str, change: &ScheduleChange<'_>) -> Result<()> {
-        let context = change.validate(name, "update a schedule")?;
+        change.validate(name, "update a schedule")?;
+        let context = change.encode_context(self.connection().serializer())?;
         self.connection()
             .update_schedule(name, change, context.as_deref(), None)
             .await
@@ -805,8 +904,9 @@ impl Connection {
         spec: &ScheduleSpec,
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
+        let context = spec.encode_context(self.serializer())?;
         self.sysdb()
-            .create_schedule(&spec.as_new(), caller)
+            .create_schedule(&spec.as_new(&context), caller)
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(schedule = spec.schedule_name, "created a schedule");
@@ -814,7 +914,15 @@ impl Connection {
     }
 
     pub(crate) async fn apply_schedules(&self, specs: &[ScheduleSpec]) -> Result<()> {
-        let rows: Vec<NewSchedule<'_>> = specs.iter().map(ScheduleSpec::as_new).collect();
+        let contexts = specs
+            .iter()
+            .map(|spec| spec.encode_context(self.serializer()))
+            .collect::<Result<Vec<_>>>()?;
+        let rows: Vec<NewSchedule<'_>> = specs
+            .iter()
+            .zip(&contexts)
+            .map(|(spec, context)| spec.as_new(context))
+            .collect();
         self.sysdb()
             .apply_schedules(&rows)
             .await
@@ -1103,12 +1211,8 @@ impl Connection {
             .map_err(Error::SystemDatabase)?
             .map(|version| version.version_name);
         // Decoded to a value and encoded again inside each input, rather than spliced in as text,
-        // so a context that is not JSON fails here rather than in every run.
-        let context = decode(
-            Some(&record.context),
-            &PayloadEncoding::Native,
-            "schedule context",
-        )?;
+        // so a context that cannot be read fails here rather than in every run.
+        let context = decode_context(&record.context, self.serializer())?;
         let key = WorkflowKey::from_row(
             record.workflow_name.as_str(),
             record.workflow_class_name.as_deref(),
@@ -1126,6 +1230,19 @@ impl Connection {
             serialization,
         })
     }
+}
+
+/// Decodes a schedule's context with the configured serializer.
+///
+/// The column carries no tag to say how the context was encoded, so it is read as the configured
+/// serializer would have written it, whoever did.
+///
+/// **Read as the JSON data it was written as**, a `serde_json::Value`, and only then as `C`, so a
+/// type whose form depends on whether the format is human-readable reads back as it was written.
+fn decode_context<C: DeserializeOwned>(context: &str, configured: &Serializer) -> Result<C> {
+    const WHAT: &str = "schedule context";
+    let value: serde_json::Value = decode(Some(context), &configured.encoding(), WHAT)?;
+    serde_json::from_value(value).map_err(|source| Error::decode_failed(WHAT, source))
 }
 
 /// A `SystemTime` as the calendar library's instant.
@@ -1163,20 +1280,23 @@ mod tests {
 
     #[test]
     fn a_schedule_reads_back_everything_its_row_holds() {
-        let schedule = Schedule::from_record(ScheduleRecord {
-            schedule_id: "id-1".into(),
-            schedule_name: "nightly".into(),
-            workflow_name: "report".into(),
-            workflow_class_name: Some("Reports".into()),
-            schedule: "0 0 2 * * *".into(),
-            status: ScheduleStatus::Paused,
-            context: r#""emea""#.into(),
-            last_fired_at: Some(Timestamp::from_epoch_ms(1_759_665_600_000)),
-            automatic_backfill: true,
-            cron_timezone: Some("Europe/Paris".into()),
-            queue_name: Some("reports".into()),
-            application_name: Some("app".into()),
-        });
+        let schedule = Schedule::from_record(
+            ScheduleRecord {
+                schedule_id: "id-1".into(),
+                schedule_name: "nightly".into(),
+                workflow_name: "report".into(),
+                workflow_class_name: Some("Reports".into()),
+                schedule: "0 0 2 * * *".into(),
+                status: ScheduleStatus::Paused,
+                context: r#""emea""#.into(),
+                last_fired_at: Some(Timestamp::from_epoch_ms(1_759_665_600_000)),
+                automatic_backfill: true,
+                cron_timezone: Some("Europe/Paris".into()),
+                queue_name: Some("reports".into()),
+                application_name: Some("app".into()),
+            },
+            &Serializer::RustSerde,
+        );
         assert_eq!(schedule.id(), "id-1");
         assert_eq!(schedule.name(), "nightly");
         assert_eq!(
@@ -1201,13 +1321,171 @@ mod tests {
         assert_eq!(schedule.application_name(), Some("app"));
     }
 
+    /// JSON, reversed: text only this serializer reads.
+    #[derive(Debug)]
+    struct Backwards;
+
+    impl crate::CustomSerializer for Backwards {
+        fn name(&self) -> &str {
+            "backwards_json"
+        }
+
+        fn serialize(
+            &self,
+            value: crate::Payload<'_>,
+        ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(serde_json::to_string(&value)?.chars().rev().collect())
+        }
+
+        fn deserialize(
+            &self,
+            text: &str,
+            into: crate::PayloadSlot<'_>,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let json: String = text.chars().rev().collect();
+            let mut deserializer = serde_json::Deserializer::from_str(&json);
+            into.fill(&mut deserializer)?;
+            Ok(deserializer.end()?)
+        }
+    }
+
+    /// MessagePack, as hex: a format that is not human-readable, as an application's binary
+    /// serializer would be.
+    #[derive(Debug)]
+    struct MessagePack;
+
+    impl crate::CustomSerializer for MessagePack {
+        fn name(&self) -> &str {
+            "msgpack_hex"
+        }
+
+        fn serialize(
+            &self,
+            value: crate::Payload<'_>,
+        ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            let bytes = rmp_serde::to_vec(&value)?;
+            Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+
+        fn deserialize(
+            &self,
+            text: &str,
+            into: crate::PayloadSlot<'_>,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let bytes = (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text[at..at + 2], 16))
+                .collect::<std::result::Result<Vec<u8>, _>>()?;
+            into.fill(&mut rmp_serde::Deserializer::new(bytes.as_slice()))
+        }
+    }
+
+    /// An `Ipv4Addr` is a string in JSON and four octets in MessagePack. The context is stored as its
+    /// JSON data, so it is read back as that, directly and inside a scheduled run's input, rather
+    /// than as the octets a MessagePack reader of `Ipv4Addr` would expect.
+    #[test]
+    fn a_context_reads_back_through_a_format_that_is_not_human_readable() {
+        let binary = Serializer::custom(MessagePack);
+        let address = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        let spec =
+            ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), "* * * * *", &address).unwrap();
+        let stored = spec.encode_context(&binary).unwrap();
+
+        // Read as `Ipv4Addr` straight from MessagePack, the stored string is not what it expects.
+        assert!(
+            decode::<std::net::Ipv4Addr, crate::error::EngineOnly>(
+                Some(&stored),
+                &binary.encoding(),
+                "context"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_context::<std::net::Ipv4Addr>(&stored, &binary).unwrap(),
+            address
+        );
+
+        // A run is called with the context the tick read, as a value, encoded in its input.
+        let fired: serde_json::Value = decode_context(&stored, &binary).unwrap();
+        let input = crate::serialization::encode_input::<_, crate::error::EngineOnly>(
+            &ScheduledWorkflowInput {
+                scheduled_time: SystemTime::UNIX_EPOCH,
+                context: fired,
+            },
+            &binary.encoding(),
+        )
+        .unwrap();
+        let read: ScheduledWorkflowInput<std::net::Ipv4Addr> =
+            crate::serialization::decode_input::<_, crate::error::EngineOnly>(
+                Some(&input),
+                &binary.encoding(),
+            )
+            .unwrap();
+        assert_eq!(read.context, address);
+
+        // And an input built with the typed context reads back the same.
+        let typed = crate::serialization::encode_input::<_, crate::error::EngineOnly>(
+            &ScheduledWorkflowInput {
+                scheduled_time: SystemTime::UNIX_EPOCH,
+                context: address,
+            },
+            &binary.encoding(),
+        )
+        .unwrap();
+        assert_eq!(typed, input);
+    }
+
+    /// A context carries no tag, so it is read only by the serializer that wrote it.
+    #[test]
+    fn a_context_is_read_by_the_configured_serializer_alone() {
+        let custom = Serializer::custom(Backwards);
+        let spec =
+            ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), "* * * * *", &[1, 2]).unwrap();
+        let sealed = spec.encode_context(&custom).unwrap();
+        assert_eq!(sealed, "]2,1[");
+        let plain = spec.encode_context(&Serializer::RustSerde).unwrap();
+        assert_eq!(plain, "[1,2]");
+
+        assert_eq!(decode_context::<Vec<u8>>(&sealed, &custom).unwrap(), [1, 2]);
+        assert!(decode_context::<Vec<u8>>(&plain, &custom).is_err());
+        assert_eq!(
+            decode_context::<Vec<u8>>(&plain, &Serializer::RustSerde).unwrap(),
+            [1, 2]
+        );
+        assert!(decode_context::<Vec<u8>>(&sealed, &Serializer::RustSerde).is_err());
+    }
+
     #[test]
     fn an_empty_class_name_reads_as_none() {
-        let schedule = Schedule::from_record(ScheduleRecord {
+        let schedule = Schedule::from_record(
+            ScheduleRecord {
+                schedule_id: "id".into(),
+                schedule_name: "s".into(),
+                workflow_name: "w".into(),
+                workflow_class_name: Some(String::new()),
+                schedule: "* * * * *".into(),
+                status: ScheduleStatus::Active,
+                context: "null".into(),
+                last_fired_at: None,
+                automatic_backfill: false,
+                cron_timezone: None,
+                queue_name: None,
+                application_name: None,
+            },
+            &Serializer::RustSerde,
+        );
+        assert_eq!(schedule.workflow(), &WorkflowKey::new("w"));
+        assert_eq!(schedule.last_fired_at(), None);
+    }
+
+    /// Two handles, each with its own instance of a serializer, see the same schedule.
+    #[test]
+    fn views_of_one_row_are_equal_whatever_reads_them() {
+        let record = ScheduleRecord {
             schedule_id: "id".into(),
             schedule_name: "s".into(),
             workflow_name: "w".into(),
-            workflow_class_name: Some(String::new()),
+            workflow_class_name: None,
             schedule: "* * * * *".into(),
             status: ScheduleStatus::Active,
             context: "null".into(),
@@ -1216,9 +1494,19 @@ mod tests {
             cron_timezone: None,
             queue_name: None,
             application_name: None,
-        });
-        assert_eq!(schedule.workflow(), &WorkflowKey::new("w"));
-        assert_eq!(schedule.last_fired_at(), None);
+        };
+        let one = Schedule::from_record(record.clone(), &Serializer::custom(Backwards));
+        let other = Schedule::from_record(record.clone(), &Serializer::custom(Backwards));
+        assert_eq!(one, other);
+        assert_eq!(
+            one,
+            Schedule::from_record(record.clone(), &Serializer::RustSerde)
+        );
+        let changed = ScheduleRecord {
+            context: "1".into(),
+            ..record
+        };
+        assert_ne!(one, Schedule::from_record(changed, &Serializer::RustSerde));
     }
 
     #[test]

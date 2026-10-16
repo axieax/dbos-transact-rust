@@ -73,7 +73,7 @@ use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::{DurableError, Error};
 use crate::instance::Executor;
-use crate::serialization::{PayloadEncoding, decode_error};
+use crate::serialization::{PayloadEncoding, Serializer, decode_error};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// What a durable call works out at the call, before anything of it has run.
@@ -414,11 +414,17 @@ pub(crate) enum StepDurability<'a> {
 /// one is rebuilt from its envelope. A tag this SDK cannot read is
 /// [`Error::UnknownSerialization`], as it is for every other payload.
 ///
-/// Falls back to a plain message when the bytes, in an encoding this SDK reads, are not one of
-/// ours — an error some other build wrote in a shape this one does not know. A readable message
-/// beats a decode failure standing in for somebody else's error.
-pub(crate) fn revive<E: DurableError>(recorded: &str, tag: Option<&str>, step: &str) -> Error<E> {
-    match PayloadEncoding::of(tag) {
+/// Falls back to a plain message when the bytes, in a built-in encoding, are not one of ours — an
+/// error some other build wrote in a shape this one does not know. A readable message beats a
+/// decode failure standing in for somebody else's error. A custom serializer's text is no
+/// readable message, so one it cannot decode is reported as [`Error::Deserialization`].
+pub(crate) fn revive<E: DurableError>(
+    recorded: &str,
+    tag: Option<&str>,
+    configured: &Serializer,
+    step: &str,
+) -> Error<E> {
+    match PayloadEncoding::of(tag, configured) {
         Err(unknown) => unknown,
         Ok(encoding) => decode_error(recorded, &encoding).unwrap_or_else(|| Error::StepFailed {
             step: step.to_owned(),
@@ -879,7 +885,12 @@ mod tests {
     /// replay on a decode.
     #[test]
     fn a_step_error_that_does_not_decode_revives_as_its_text() {
-        let revived = revive::<EngineOnly>("sealed", Some("rust_serde"), "charge");
+        let revived = revive::<EngineOnly>(
+            "sealed",
+            Some("rust_serde"),
+            &Serializer::RustSerde,
+            "charge",
+        );
         assert!(
             matches!(&revived, Error::StepFailed { step, message } if step == "charge" && message == "sealed"),
             "{revived:?}"
@@ -890,7 +901,12 @@ mod tests {
     /// payload's is, rather than passed off as the step's failure.
     #[test]
     fn a_step_error_in_an_unknown_encoding_is_reported() {
-        let revived = revive::<EngineOnly>("sealed", Some("backwards_json"), "charge");
+        let revived = revive::<EngineOnly>(
+            "sealed",
+            Some("backwards_json"),
+            &Serializer::RustSerde,
+            "charge",
+        );
         assert!(
             matches!(&revived, Error::UnknownSerialization { name } if name == "backwards_json"),
             "{revived:?}"
@@ -909,7 +925,12 @@ mod tests {
             &PayloadEncoding::Portable,
         )
         .unwrap();
-        let revived = revive::<EngineOnly>(&recorded, Some("portable_json"), "other");
+        let revived = revive::<EngineOnly>(
+            &recorded,
+            Some("portable_json"),
+            &Serializer::RustSerde,
+            "other",
+        );
         assert!(
             matches!(&revived, Error::StepFailed { step, message } if step == "charge" && message == "declined"),
             "{revived:?}"
