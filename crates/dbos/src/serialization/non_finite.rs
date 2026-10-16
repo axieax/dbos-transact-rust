@@ -427,7 +427,14 @@ struct Wrap<V>(V);
 /// goes to the float's own visitor, which accepts or refuses it as it would have.
 struct FloatVisitor<V> {
     inner: V,
-    single: bool,
+    asked_for: FloatType,
+}
+
+/// Which float type a request asked for, so a name is handed on as that type.
+#[derive(Debug, Clone, Copy)]
+enum FloatType {
+    F32,
+    F64,
 }
 
 /// A seed whose deserializer is wrapped in [`Lenient`].
@@ -476,14 +483,14 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Lenient<D> {
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
         self.0.deserialize_any(FloatVisitor {
             inner: visitor,
-            single: true,
+            asked_for: FloatType::F32,
         })
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
         self.0.deserialize_any(FloatVisitor {
             inner: visitor,
-            single: false,
+            asked_for: FloatType::F64,
         })
     }
 
@@ -621,11 +628,11 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for FloatVisitor<V> {
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        match named(v) {
+        match (named(v), self.asked_for) {
             // Only non-finite values are narrowed here, and they keep their meaning in `f32`.
-            Some(float) if self.single => self.inner.visit_f32(float as f32),
-            Some(float) => self.inner.visit_f64(float),
-            None => self.inner.visit_str(v),
+            (Some(float), FloatType::F32) => self.inner.visit_f32(float as f32),
+            (Some(float), FloatType::F64) => self.inner.visit_f64(float),
+            (None, _) => self.inner.visit_str(v),
         }
     }
 
