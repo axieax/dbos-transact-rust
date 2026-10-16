@@ -17,11 +17,14 @@
 //! this process cannot read — neither built-in, nor the name of the serializer it is configured
 //! with — is [`Error::UnknownSerialization`], never a guess.
 //!
-//! **A non-finite float is refused on the way in**, by both built-in encodings. JSON has no way to
-//! write `NaN` or an infinity, and `serde_json` would write `null` in its place, which reads back
-//! as something else. Writing one is [`Error::Serialization`] naming the value. An application
-//! that needs them stores them in its own representation, or uses a [`CustomSerializer`] whose
-//! format has them.
+//! **Non-finite floats round-trip natively and are refused portably.** JSON has no way to write
+//! `NaN` or an infinity, and `serde_json` would write `null` in its place, which reads back as
+//! something else. The native encoding writes them as the strings `"NaN"`, `"Infinity"` and
+//! `"-Infinity"` and reads those back as floats wherever a float is asked for. The portable one
+//! refuses them with [`Error::Serialization`] naming the value, since the SDKs that read it agree
+//! on no form for them. A target that buffers its input before deciding what it is — a
+//! `#[serde(untagged)]` enum, a `#[serde(flatten)]` field, a [`serde_json::Value`] — reads the
+//! native strings as strings.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,9 +37,9 @@ use serde_json::{Map, Value};
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::sysdb::types::EncodedValue;
 
-mod finite;
+mod non_finite;
 mod shape;
-use finite::Finite;
+use non_finite::{Floats, NonFinite};
 use shape::{Shape, takes_the_envelope};
 
 /// The tag a [`PayloadEncoding::Native`] row carries.
@@ -437,6 +440,8 @@ pub(crate) fn decode<T: DeserializeOwned, E>(
                 source: None,
             })
         }
+        (_, PayloadEncoding::Native) => non_finite::from_str(value.unwrap_or("null"))
+            .map_err(|source| Error::decode_failed(what, source)),
         _ => serde_json::from_str(value.unwrap_or("null"))
             .map_err(|source| Error::decode_failed(what, source)),
     }
@@ -482,8 +487,8 @@ pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
 ///
 /// Native and portable are the same JSON for a plain value — a workflow's output, an event, a
 /// message, a stream value. What they change is the envelope around a workflow's input or error,
-/// which [`encode_input`] and [`encode_error`] add. Both refuse a non-finite float anywhere in the
-/// value, rather than letting `serde_json` write it as `null`.
+/// which [`encode_input`] and [`encode_error`] add. They also differ on a non-finite float, which
+/// `serde_json` would write as `null`: native writes it as its name, and portable refuses it.
 pub(crate) fn encode<T: Serialize, E>(
     value: &T,
     encoding: &PayloadEncoding,
@@ -499,10 +504,10 @@ pub(crate) fn encode<T: Serialize, E>(
                     source: None,
                 })
         }
-        PayloadEncoding::Native | PayloadEncoding::Portable => {
-            serde_json::to_string(&Finite(value))
-                .map_err(|source| Error::encode_failed(what, source))
-        }
+        PayloadEncoding::Native => serde_json::to_string(&Floats::new(value, NonFinite::Name))
+            .map_err(|source| Error::encode_failed(what, source)),
+        PayloadEncoding::Portable => serde_json::to_string(&Floats::new(value, NonFinite::Refuse))
+            .map_err(|source| Error::encode_failed(what, source)),
     }
 }
 
@@ -1525,72 +1530,118 @@ mod tests {
         assert!(encode::<_, EngineOnly>(&tuple_keys, &PayloadEncoding::Native, "value").is_err());
     }
 
-    /// A non-finite float is refused wherever it is in the value, by both built-in encodings,
-    /// rather than written as a `null` that reads back as something else. The error names the
-    /// value being written.
+    /// A non-finite float round-trips through the native encoding, wherever it is in the value, and
+    /// is refused by the portable one with an error naming the value. Finite floats, and everything
+    /// around them, are written the same way by both.
     #[test]
-    fn a_non_finite_float_is_refused() {
-        #[derive(Serialize)]
+    fn non_finite_floats_round_trip_natively_and_are_refused_portably() {
+        #[derive(Debug, Serialize, Deserialize)]
         struct Reading {
-            name: &'static str,
+            name: String,
             value: Option<f64>,
+            many: Vec<f32>,
         }
-        #[derive(Serialize)]
+        #[derive(Debug, Serialize, Deserialize)]
         enum Sample {
             Point(f32),
+            Pair(f64, f64),
             Range { low: f64, high: f64 },
         }
 
-        fn refused<T: Serialize>(value: &T, encoding: &PayloadEncoding) {
-            let error = encode::<_, EngineOnly>(value, encoding, "result")
-                .expect_err("a non-finite float was written");
+        fn round_trip<T: Serialize + DeserializeOwned>(value: &T) -> (String, T) {
+            let text = encode::<_, EngineOnly>(value, &PayloadEncoding::Native, "result")
+                .expect("a native write");
+            let back = decode::<T, EngineOnly>(Some(&text), &PayloadEncoding::Native, "result")
+                .unwrap_or_else(|e| panic!("{text} did not read back: {e}"));
+            (text, back)
+        }
+        fn same(a: f64, b: f64) -> bool {
+            a == b || (a.is_nan() && b.is_nan())
+        }
+
+        let (text, back) = round_trip(&f64::NAN);
+        assert_eq!(text, r#""NaN""#);
+        assert!(back.is_nan());
+        assert_eq!(
+            round_trip(&f64::INFINITY),
+            (r#""Infinity""#.to_owned(), f64::INFINITY)
+        );
+        assert_eq!(
+            round_trip(&f64::NEG_INFINITY),
+            (r#""-Infinity""#.to_owned(), f64::NEG_INFINITY)
+        );
+        assert!(round_trip(&f32::NAN).1.is_nan());
+        assert_eq!(round_trip(&f32::NEG_INFINITY).1, f32::NEG_INFINITY);
+
+        let reading = Reading {
+            name: "NaN".to_owned(),
+            value: Some(f64::INFINITY),
+            many: vec![1.5, f32::NAN, f32::NEG_INFINITY],
+        };
+        let (text, back) = round_trip(&reading);
+        assert_eq!(
+            text,
+            r#"{"name":"NaN","value":"Infinity","many":[1.5,"NaN","-Infinity"]}"#
+        );
+        assert_eq!(back.name, "NaN", "a string field keeps the string");
+        assert_eq!(back.value, Some(f64::INFINITY));
+        assert_eq!(back.many[0], 1.5);
+        assert!(back.many[1].is_nan());
+        assert_eq!(back.many[2], f32::NEG_INFINITY);
+
+        let map = BTreeMap::from([("k".to_owned(), f64::NAN)]);
+        assert!(round_trip(&map).1["k"].is_nan());
+        let (_, tuple) = round_trip(&(1u32, f64::INFINITY));
+        assert_eq!(tuple, (1, f64::INFINITY));
+        for sample in [
+            Sample::Point(f32::INFINITY),
+            Sample::Pair(f64::NAN, 2.0),
+            Sample::Range {
+                low: f64::NEG_INFINITY,
+                high: 0.0,
+            },
+        ] {
+            let (_, back) = round_trip(&sample);
+            let ok = match (&sample, &back) {
+                (Sample::Point(a), Sample::Point(b)) => same(f64::from(*a), f64::from(*b)),
+                (Sample::Pair(a, b), Sample::Pair(c, d)) => same(*a, *c) && same(*b, *d),
+                (Sample::Range { low: a, high: b }, Sample::Range { low: c, high: d }) => {
+                    same(*a, *c) && same(*b, *d)
+                }
+                _ => false,
+            };
+            assert!(ok, "{sample:?} read back as {back:?}");
+        }
+
+        // A name is read as a float only where a float is asked for; elsewhere it is refused as
+        // any other string would be.
+        assert!(
+            decode::<u32, EngineOnly>(Some(r#""NaN""#), &PayloadEncoding::Native, "result")
+                .is_err()
+        );
+        assert!(
+            decode::<f64, EngineOnly>(Some(r#""nan""#), &PayloadEncoding::Native, "result")
+                .is_err(),
+            "only the exact names are floats"
+        );
+
+        fn refused<T: Serialize>(value: &T) {
+            let error = encode::<_, EngineOnly>(value, &PayloadEncoding::Portable, "result")
+                .expect_err("a non-finite float was written portably");
             let Error::Serialization { what, message, .. } = &error else {
                 panic!("not a serialization error: {error}");
             };
             assert_eq!(what, "result");
             assert!(message.contains("not a finite number"), "{message}");
         }
+        refused(&f64::NAN);
+        refused(&f64::INFINITY);
+        refused(&f32::NEG_INFINITY);
+        refused(&reading);
+        refused(&map);
+        refused(&Sample::Pair(1.0, f64::NAN));
 
         for encoding in [PayloadEncoding::Native, PayloadEncoding::Portable] {
-            refused(&f64::NAN, &encoding);
-            refused(&f64::INFINITY, &encoding);
-            refused(&f64::NEG_INFINITY, &encoding);
-            refused(&f32::NAN, &encoding);
-            refused(&vec![1.0, f64::NAN], &encoding);
-            refused(&(1u32, f64::INFINITY), &encoding);
-            refused(
-                &Reading {
-                    name: "t",
-                    value: Some(f64::NAN),
-                },
-                &encoding,
-            );
-            refused(
-                &std::collections::BTreeMap::from([("k", f64::NAN)]),
-                &encoding,
-            );
-            refused(&Sample::Point(f32::INFINITY), &encoding);
-            refused(
-                &Sample::Range {
-                    low: 0.0,
-                    high: f64::INFINITY,
-                },
-                &encoding,
-            );
-
-            // Finite floats, and everything around them, are written as before.
-            assert_eq!(
-                encode::<_, EngineOnly>(
-                    &Reading {
-                        name: "t",
-                        value: Some(1.5),
-                    },
-                    &encoding,
-                    "result"
-                )
-                .unwrap(),
-                r#"{"name":"t","value":1.5}"#
-            );
             assert_eq!(
                 encode::<_, EngineOnly>(
                     &Sample::Range {
@@ -1609,10 +1660,15 @@ mod tests {
             );
         }
 
-        // A workflow input is checked inside the portable envelope too.
+        // A workflow input is checked inside the portable envelope too, and round-trips natively.
         assert!(
             encode_input::<_, EngineOnly>(&(1u32, f64::NAN), &PayloadEncoding::Portable).is_err()
         );
+        let input = encode_input::<_, EngineOnly>(&(1u32, f64::NAN), &PayloadEncoding::Native)
+            .expect("a native input");
+        let (n, x) = decode_input::<(u32, f64), EngineOnly>(Some(&input), &PayloadEncoding::Native)
+            .expect("the input read back");
+        assert!(n == 1 && x.is_nan(), "{input}");
     }
 
     /// JSON, reversed: text no built-in reader would accept.
