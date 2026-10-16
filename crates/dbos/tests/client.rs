@@ -731,7 +731,8 @@ async fn a_client_manages_queues() {
 /// something with a lifecycle — and it is the case that leaks unless the drop aborts the listener:
 /// that task holds its own clone of the pool, so the pool cannot close itself, and the listener's
 /// only way out of its loop is that close. An abandoned client would mean a `LISTEN` connection and
-/// two tasks for the life of the process.
+/// two tasks for the life of the process. So the listener is turned on here; a client starts
+/// none by default.
 #[tokio::test]
 async fn a_dropped_client_releases_its_connections() {
     // Tagged so this counts its own connections and not another test's, on a shared server.
@@ -740,6 +741,7 @@ async fn a_dropped_client_releases_its_connections() {
     let db = test_database().await;
     let client = Client::connect(ClientConfig {
         app_name: Some("client-drop".to_owned()),
+        use_listen_notify: true,
         ..ClientConfig::new(format!("{}?application_name={TAG}", db.url()))
     })
     .await
