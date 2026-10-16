@@ -13,14 +13,30 @@
 //!   strings back as floats wherever a float is asked for.
 //! - **Portable** (`portable_json`) refuses it. Every SDK reads portable payloads, and there is no
 //!   form for these values that they agree on, so writing one would be read differently, or not at
-//!   all, elsewhere.
+//!   all, elsewhere. The same goes for anything converted to a [`serde_json::Value`] before it is
+//!   encoded, such as a portable error's fields or a schedule's context: a `Value` can't hold a
+//!   non-finite float either.
+//!
+//! **How a float request is answered.** `serde_json` refuses a string where a float is asked for,
+//! so [`Lenient`] asks for whatever is there instead (`deserialize_any`) and decides itself. That
+//! changes three things beyond reading the names:
+//!
+//! - A map key is always a string in JSON, so a float key is read as the number its text spells,
+//!   as `serde_json` reads one. So is any other string that spells a number where a float is
+//!   asked for, which `serde_json` would refuse.
+//! - With `serde_json`'s `arbitrary_precision` feature, which any crate in an application can turn
+//!   on, a number arrives as a map holding its text; it is read through [`serde_json::Number`].
+//! - An `f32` is parsed as an `f64` and narrowed, as `serde_json` does unless its `float_roundtrip`
+//!   feature is on.
 //!
 //! **What doesn't read a name back as a float:** a target that buffers its input before deciding
-//! what it is — a `#[serde(untagged)]` enum, a `#[serde(flatten)]` field — sees the string, not a
-//! float request, and so does a [`serde_json::Value`].
+//! what it is — an untagged, internally tagged or adjacently tagged enum, a `#[serde(flatten)]`
+//! field — sees the string, not a float request, and so does a [`serde_json::Value`]. Such a type
+//! reads a stored name as a decode error.
 
 use std::fmt::{self, Display};
 
+use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, DeserializeSeed, Deserializer, Visitor};
 use serde::ser::{self, Serialize, Serializer};
 
@@ -33,7 +49,7 @@ pub(super) const NEG_INFINITY: &str = "-Infinity";
 
 /// What to do with a non-finite float on the way into JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NonFinite {
+pub(crate) enum NonFinite {
     /// Write it as its name, which [`from_str`] reads back.
     Name,
     /// Fail the write.
@@ -41,13 +57,13 @@ pub(super) enum NonFinite {
 }
 
 /// `value`, with every non-finite float in it handled as `mode` says when serialized.
-pub(super) struct Floats<'a, T: ?Sized> {
+pub(crate) struct Floats<'a, T: ?Sized> {
     value: &'a T,
     mode: NonFinite,
 }
 
 impl<'a, T: ?Sized> Floats<'a, T> {
-    pub(super) fn new(value: &'a T, mode: NonFinite) -> Self {
+    pub(crate) fn new(value: &'a T, mode: NonFinite) -> Self {
         Self { value, mode }
     }
 }
@@ -620,6 +636,20 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Wrap<V> {
     }
 }
 
+impl<V> FloatVisitor<V> {
+    /// Hands `float` on as the type that was asked for.
+    fn float<'de, E: de::Error>(self, float: f64) -> Result<V::Value, E>
+    where
+        V: Visitor<'de>,
+    {
+        match self.asked_for {
+            // Narrowed only as `serde_json` narrows an `f64` it parsed for an `f32` request.
+            FloatType::F32 => self.inner.visit_f32(float as f32),
+            FloatType::F64 => self.inner.visit_f64(float),
+        }
+    }
+}
+
 impl<'de, V: Visitor<'de>> Visitor<'de> for FloatVisitor<V> {
     type Value = V::Value;
 
@@ -627,27 +657,29 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for FloatVisitor<V> {
         self.inner.expecting(f)
     }
 
+    /// A float that arrives as a string: one of the three names, or a map key, which JSON always
+    /// quotes, so a float key is the number its text spells. Anything else goes to the float's
+    /// own visitor, which refuses it.
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        match (named(v), self.asked_for) {
-            // Only non-finite values are narrowed here, and they keep their meaning in `f32`.
-            (Some(float), FloatType::F32) => self.inner.visit_f32(float as f32),
-            (Some(float), FloatType::F64) => self.inner.visit_f64(float),
-            (None, _) => self.inner.visit_str(v),
+        if let Some(float) = named(v) {
+            return self.float(float);
+        }
+        let spelled = match self.asked_for {
+            FloatType::F32 => serde_json::from_str::<f32>(v).map(f64::from),
+            FloatType::F64 => serde_json::from_str::<f64>(v),
+        };
+        match spelled {
+            Ok(float) => self.float(float),
+            Err(_) => self.inner.visit_str(v),
         }
     }
 
     fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
-        if named(v).is_some() {
-            return self.visit_str(v);
-        }
-        self.inner.visit_borrowed_str(v)
+        self.visit_str(v)
     }
 
     fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-        if named(&v).is_some() {
-            return self.visit_str(&v);
-        }
-        self.inner.visit_string(v)
+        self.visit_str(&v)
     }
 
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
@@ -674,8 +706,19 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for FloatVisitor<V> {
         self.inner.visit_seq(Access(seq))
     }
 
+    /// A number that isn't an integer, when `serde_json`'s `arbitrary_precision` feature is on:
+    /// `deserialize_any` then hands it over as a map holding its text, which [`serde_json::Number`]
+    /// knows how to read. Feature unification can turn that feature on from any crate in the
+    /// application. Without it, a map here is a real JSON object, which `Number` refuses.
     fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-        self.inner.visit_map(Access(map))
+        let number = serde_json::Number::deserialize(de::value::MapAccessDeserializer::new(map))?;
+        match number.as_f64() {
+            Some(float) => self.float(float),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::Other("an unrepresentable number"),
+                &self,
+            )),
+        }
     }
 }
 

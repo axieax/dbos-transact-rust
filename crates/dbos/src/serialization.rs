@@ -23,8 +23,8 @@
 //! `"-Infinity"` and reads those back as floats wherever a float is asked for. The portable one
 //! refuses them with [`Error::Serialization`] naming the value, since the SDKs that read it agree
 //! on no form for them. A target that buffers its input before deciding what it is — a
-//! `#[serde(untagged)]` enum, a `#[serde(flatten)]` field, a [`serde_json::Value`] — reads the
-//! native strings as strings.
+//! `#[serde(untagged)]` or tagged enum, a `#[serde(flatten)]` field, a [`serde_json::Value`] —
+//! reads the native strings as strings.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use crate::sysdb::types::EncodedValue;
 
 mod non_finite;
 mod shape;
-use non_finite::{Floats, NonFinite};
+pub(crate) use non_finite::{Floats, NonFinite};
 use shape::{Shape, takes_the_envelope};
 
 /// The tag a [`PayloadEncoding::Native`] row carries.
@@ -504,10 +504,15 @@ pub(crate) fn encode<T: Serialize, E>(
                     source: None,
                 })
         }
-        PayloadEncoding::Native => serde_json::to_string(&Floats::new(value, NonFinite::Name))
-            .map_err(|source| Error::encode_failed(what, source)),
-        PayloadEncoding::Portable => serde_json::to_string(&Floats::new(value, NonFinite::Refuse))
-            .map_err(|source| Error::encode_failed(what, source)),
+        PayloadEncoding::Native | PayloadEncoding::Portable => {
+            let mode = if matches!(encoding, PayloadEncoding::Native) {
+                NonFinite::Name
+            } else {
+                NonFinite::Refuse
+            };
+            serde_json::to_string(&Floats::new(value, mode))
+                .map_err(|source| Error::encode_failed(what, source))
+        }
     }
 }
 
@@ -761,7 +766,10 @@ fn to_portable<E: DurableError>(
             name: type_name::<E>().to_owned(),
             message: application.to_string(),
             code: None,
-            data: present(serde_json::value::to_raw_value(application)?),
+            data: present(serde_json::value::to_raw_value(&Floats::new(
+                application,
+                NonFinite::Refuse,
+            ))?),
         },
         Error::Portable {
             name,
@@ -821,7 +829,7 @@ fn type_name<E>() -> &'static str {
 fn variant<E: DurableError>(
     error: &Error<E>,
 ) -> std::result::Result<(String, Option<Value>), serde_json::Error> {
-    let (name, fields) = match serde_json::to_value(error)? {
+    let (name, fields) = match serde_json::to_value(Floats::new(error, NonFinite::Refuse))? {
         Value::String(unit) => (unit, None),
         Value::Object(tagged) if tagged.len() == 1 => {
             let (name, fields) = tagged.into_iter().next().expect("one entry");
@@ -1659,6 +1667,57 @@ mod tests {
                 serde_json::to_string(&f64::MAX).unwrap()
             );
         }
+
+        // A float map key is written as a quoted number, as `serde_json` always writes keys, and
+        // read back as the number it spells; so is a string holding a number where a float is
+        // asked for.
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+        struct Key(f64);
+        impl PartialEq for Key {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.total_cmp(&other.0).is_eq()
+            }
+        }
+        impl Eq for Key {}
+        impl PartialOrd for Key {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Key {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.total_cmp(&other.0)
+            }
+        }
+        let keyed = BTreeMap::from([(Key(1.5), 7u32), (Key(-2.0), 8)]);
+        let (text, back) = round_trip(&keyed);
+        assert_eq!(text, r#"{"-2.0":8,"1.5":7}"#);
+        assert_eq!(back, keyed);
+        assert_eq!(
+            decode::<f32, EngineOnly>(Some(r#""2.5""#), &PayloadEncoding::Native, "result")
+                .unwrap(),
+            2.5
+        );
+
+        // A portable error's fields go through a `Value`, which can't hold a non-finite float.
+        #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+        #[error("insufficient funds")]
+        struct Insufficient {
+            balance: f64,
+        }
+        let error: Error<Insufficient> = Error::Application(Insufficient { balance: f64::NAN });
+        assert!(
+            encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).is_err(),
+            "a portable error wrote a non-finite float"
+        );
+        let native = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Native)
+            .expect("a native error");
+        let Some(Error::Application(Insufficient { balance })) =
+            decode_error::<Insufficient>(&native, &PayloadEncoding::Native)
+        else {
+            panic!("{native} did not read back as the application error");
+        };
+        assert!(balance.is_nan());
 
         // A workflow input is checked inside the portable envelope too, and round-trips natively.
         assert!(
