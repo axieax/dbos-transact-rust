@@ -18,6 +18,7 @@
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
 //! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
+use crate::serialization::{PayloadEncoding, decode};
 use std::borrow::Cow;
 
 /// The error type of a workflow or step with no failure of its own.
@@ -251,6 +252,16 @@ pub enum Error<E = EngineOnly> {
         source: Option<serde_json::Error>,
     },
 
+    /// A row is tagged with an encoding this process cannot read.
+    ///
+    /// `rust_serde` is always readable. Any other tag is another SDK's encoding, and a value in it
+    /// is reported rather than guessed at.
+    #[error("serialization {name} is not available")]
+    UnknownSerialization {
+        /// The tag the row carries.
+        name: String,
+    },
+
     /// A workflow was started that this executor has no registration for.
     ///
     /// In-process this cannot happen — a `WorkflowRef` comes from a registration. It is reachable
@@ -290,11 +301,12 @@ pub enum Error<E = EngineOnly> {
         workflow_id: String,
     },
 
-    /// A workflow failed, and what it failed with was not one of ours to decode.
+    /// A workflow failed, and what it failed with did not decode.
     ///
-    /// The workflow-level twin of [`StepFailed`](Self::StepFailed), and raised for the same
-    /// reason: the row was written by another SDK, whose serializer chose its own shape. The
-    /// message is what survives. A workflow this SDK recorded comes back as the error itself.
+    /// The workflow-level twin of [`StepFailed`](Self::StepFailed). The row's tag names an
+    /// encoding this process reads, but the error in it is not one it can rebuild: written by
+    /// another build whose error type has since changed shape. The stored text is what survives.
+    /// A workflow error that decodes comes back as the error itself.
     #[error("the workflow {workflow_id} failed: {message}")]
     WorkflowFailed {
         /// The workflow that failed.
@@ -339,8 +351,8 @@ pub enum Error<E = EngineOnly> {
 
     /// A recorded step failed, and what it failed with was not one of ours to decode.
     ///
-    /// Raised on replay against a row another SDK wrote: its serializer chose its own shape, so
-    /// the message is what survives. A step this SDK recorded replays as the error itself.
+    /// Raised on replay against a row another SDK wrote, whose serializer chose its own shape. The
+    /// stored text is what survives. A step error that decodes replays as the error itself.
     #[error("the step {step} failed: {message}")]
     StepFailed {
         /// The step's name.
@@ -481,6 +493,26 @@ impl<E> From<E> for Error<E> {
 }
 
 impl<E> Error<E> {
+    /// A value that could not be encoded for its column; `what` names it, as `"argument"` or
+    /// `"result"` does.
+    pub(crate) fn encode_failed(what: &'static str, source: serde_json::Error) -> Self {
+        Error::Serialization {
+            what: what.into(),
+            message: source.to_string(),
+            source: Some(source),
+        }
+    }
+
+    /// A value that could not be decoded from its column; `what` names it, as `"argument"` or
+    /// `"result"` does.
+    pub(crate) fn decode_failed(what: &'static str, source: serde_json::Error) -> Self {
+        Error::Deserialization {
+            what: what.into(),
+            message: source.to_string(),
+            source: Some(source),
+        }
+    }
+
     /// Re-targets this error at another application error type.
     ///
     /// One match over the engine's variants, kept in a single place so [`lift`](Self::lift) and
@@ -521,6 +553,7 @@ impl<E> Error<E> {
                 message,
                 source,
             },
+            Error::UnknownSerialization { name } => Error::UnknownSerialization { name },
             Error::NotRegistered { key } => Error::NotRegistered { key },
             Error::WorkflowNotFound { workflow_id } => Error::WorkflowNotFound { workflow_id },
             Error::Interrupted { workflow_id } => Error::Interrupted { workflow_id },
@@ -660,11 +693,39 @@ impl Error<EngineOnly> {
 /// interrupted rather than wrong.
 #[derive(Debug)]
 pub(crate) enum Failure {
-    /// The workflow's own failure — the whole [`Error`] envelope, encoded by the serializer that
-    /// owns the row. This is what the error column records and what a replay decodes.
-    Recorded(String),
+    /// The workflow's own failure, encoded as the workflow's row records it. This is what the
+    /// error column holds and what a replay decodes.
+    Recorded(EncodedError),
     /// One of ours. Never recorded as the workflow's outcome.
     Control(Error<EngineOnly>),
+}
+
+/// A workflow's error as its row holds it, with the encoding that says how to read it.
+///
+/// **The encoding travels with the bytes** so a reader decodes the error as it was written rather
+/// than as it would itself have written it.
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedError {
+    /// The encoded error.
+    pub(crate) encoded: String,
+    /// How it is encoded.
+    pub(crate) encoding: PayloadEncoding,
+}
+
+impl EncodedError {
+    /// The error this records, in the caller's error type.
+    ///
+    /// An error that does not decode — one some other build wrote in a shape this one cannot read
+    /// — is reported as [`Error::WorkflowFailed`] with the bytes as its message, which is what
+    /// survives.
+    pub(crate) fn decode<E: DurableError>(&self, workflow_id: &str) -> Error<E> {
+        decode::<Error<E>, EngineOnly>(Some(&self.encoded), &self.encoding, "error").unwrap_or_else(
+            |_| Error::WorkflowFailed {
+                workflow_id: workflow_id.to_owned(),
+                message: self.encoded.clone(),
+            },
+        )
+    }
 }
 
 #[cfg(test)]

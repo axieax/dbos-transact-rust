@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::{PendingStep, StepDurability, StepPlacement, revive};
 use crate::context::{Ctx, StepStatus};
 use crate::error::{DurableError, EngineOnly, Error, Result};
-use crate::serialization::{decode, encode};
+use crate::serialization::{decode_tagged, encode};
 use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
 
 /// A step's retry predicate: given a failure, whether to try again.
@@ -410,9 +410,10 @@ where
             step_name = name,
             "the step replays from its checkpoint; the body does not run"
         );
+        let tag = recorded.serialization.as_deref();
         return match recorded.error {
-            Some(error) => Err(revive(&error, name)),
-            None => decode(recorded.output.as_deref(), "step result"),
+            Some(error) => Err(revive(&error, tag, name)),
+            None => decode_tagged(recorded.output.as_deref(), tag, "step result"),
         };
     }
 
@@ -516,11 +517,12 @@ where
         started_at,
         completed_at: Timestamp::now(),
     });
-    let serialization = Some(executor.serializer().name());
+    let encoding = executor.serializer().encoding();
+    let serialization = Some(encoding.name());
 
     match &outcome {
         Ok(value) => {
-            let output = encode(value, "step result")?;
+            let output = encode(value, &encoding, "step result")?;
             executor
                 .sysdb()
                 .record_step(
@@ -546,7 +548,7 @@ where
             debug_assert!(error.control().is_none());
             // The error itself, encoded, not a description of it: a replay gives back the error
             // that failed exactly as it gives back the value that succeeded.
-            let encoded = encode(error, "step error")?;
+            let encoded = encode(error, &encoding, "step error")?;
             executor
                 .sysdb()
                 .record_step(
@@ -962,10 +964,10 @@ mod tests {
 
     /// The one case full fidelity cannot cover: a row this SDK did not write.
     ///
-    /// A portable invocation leaves an error encoded in somebody else's shape, and no type
-    /// parameter reconstructs a type that was never Rust's. The replay degrades to the message
-    /// rather than failing to decode, so the workflow reports what happened instead of reporting
-    /// that it could not read what happened.
+    /// A portable invocation leaves an error in somebody else's shape, in an encoding this SDK
+    /// reads, and no type parameter reconstructs a type that was never Rust's. The replay degrades
+    /// to the message rather than failing to decode, so the workflow reports what happened instead
+    /// of reporting that it could not read what happened.
     #[tokio::test]
     async fn a_step_recorded_in_a_foreign_shape_degrades_to_its_message() {
         let (dbos, _db) = workflow("wf-foreign").await;
@@ -978,7 +980,7 @@ mod tests {
                 0,
                 "charge",
                 Outcome::Error(r#"{"pythonModule":"app.errors","type":"CardDeclined"}"#),
-                Some("pickle"),
+                Some("rust_serde"),
                 None,
             )
             .await
