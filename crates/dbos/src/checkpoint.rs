@@ -71,9 +71,9 @@ use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
-use crate::error::{DurableError, EngineOnly, Error};
+use crate::error::{DurableError, Error};
 use crate::instance::Executor;
-use crate::serialization::{PayloadEncoding, decode};
+use crate::serialization::{PayloadEncoding, decode_error};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// What a durable call works out at the call, before anything of it has run.
@@ -410,7 +410,8 @@ pub(crate) enum StepDurability<'a> {
 /// with its own fields, and an engine failure as the variant it was. The only payloads that do not
 /// survive are the `serde_json::Error` sources, which arrive absent rather than different.
 ///
-/// Read in the encoding its `tag` names. A tag this SDK cannot read is
+/// Read in the encoding its `tag` names, as a workflow's error is: [`decode_error`], so a portable
+/// one is rebuilt from its envelope. A tag this SDK cannot read is
 /// [`Error::UnknownSerialization`], as it is for every other payload.
 ///
 /// Falls back to a plain message when the bytes, in an encoding this SDK reads, are not one of
@@ -419,11 +420,10 @@ pub(crate) enum StepDurability<'a> {
 pub(crate) fn revive<E: DurableError>(recorded: &str, tag: Option<&str>, step: &str) -> Error<E> {
     match PayloadEncoding::of(tag) {
         Err(unknown) => unknown,
-        Ok(encoding) => decode::<Error<E>, EngineOnly>(Some(recorded), &encoding, "error")
-            .unwrap_or_else(|_| Error::StepFailed {
-                step: step.to_owned(),
-                message: recorded.to_owned(),
-            }),
+        Ok(encoding) => decode_error(recorded, &encoding).unwrap_or_else(|| Error::StepFailed {
+            step: step.to_owned(),
+            message: recorded.to_owned(),
+        }),
     }
 }
 
@@ -852,7 +852,12 @@ mod tests {
             ..crate::Config::new("placement-test", db.url())
         });
         dbos.launch().await.expect("launch failed");
-        let proper = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
+        let proper = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            "wf",
+            None,
+            crate::serialization::PayloadEncoding::Native,
+        );
         // The only way to hold one: the marker is bound by the scope, so the body reads it back
         // out. What a step body's own calls see.
         let body = || {
@@ -892,6 +897,25 @@ mod tests {
         );
     }
 
+    /// A step error recorded portably is rebuilt from its envelope, as a workflow's is, rather than
+    /// read as native bytes that do not fit and degraded to its text.
+    #[test]
+    fn a_portable_step_error_revives_as_itself() {
+        let recorded = crate::serialization::encode_error::<EngineOnly, EngineOnly>(
+            &Error::StepFailed {
+                step: "charge".to_owned(),
+                message: "declined".to_owned(),
+            },
+            &PayloadEncoding::Portable,
+        )
+        .unwrap();
+        let revived = revive::<EngineOnly>(&recorded, Some("portable_json"), "other");
+        assert!(
+            matches!(&revived, Error::StepFailed { step, message } if step == "charge" && message == "declined"),
+            "{revived:?}"
+        );
+    }
+
     fn durability(outcome: &crate::Result<StepDurability<'_>, EngineOnly>) -> &'static str {
         match outcome {
             Ok(StepDurability::Recorded { .. }) => "recorded",
@@ -909,11 +933,21 @@ mod tests {
     #[tokio::test]
     async fn a_call_is_durable_only_where_its_id_means_something() {
         let (proper, in_step, sibling, dbos, _db) = contexts().await;
-        let other = Ctx::new(dbos.executor("test").expect("launched"), "wf-other", None);
+        let other = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            "wf-other",
+            None,
+            crate::serialization::PayloadEncoding::Native,
+        );
         // The same workflow *id* under a second context, which is what a recovery re-run is. Its
         // step counter starts from zero again, so an id from the first execution means nothing in
         // it — and comparing ids rather than execution identity is exactly what would miss that.
-        let rerun = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
+        let rerun = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            "wf",
+            None,
+            crate::serialization::PayloadEncoding::Native,
+        );
         let recorded = StepPlacement::Recorded {
             ctx: proper.clone(),
             step_id: 0,

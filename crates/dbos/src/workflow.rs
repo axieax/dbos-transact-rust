@@ -19,7 +19,7 @@ use crate::error::{DurableError, EncodedError, Error, Failure, Result};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::{EncodedOutput, PayloadEncoding, encode};
+use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
     WorkflowInitResult,
@@ -403,6 +403,13 @@ pub struct Enqueue<'a> {
     /// for the singleton-workflow section that follows. The common case stays a key and nothing
     /// else.
     pub duplication_policy: DuplicationPolicy,
+    /// How the enqueued workflow's input, output and error are encoded.
+    ///
+    /// [`SerializationFormat::Default`] takes the workflow's registration —
+    /// [`WorkflowOptions::serialization`](crate::WorkflowOptions::serialization) — and
+    /// [`SerializationFormat::Portable`] or [`SerializationFormat::Native`] overrides it for this
+    /// one enqueue.
+    pub serialization: SerializationFormat,
 }
 
 /// What an enqueue does when its [`deduplication_id`](Enqueue::deduplication_id) is already held.
@@ -465,6 +472,7 @@ impl<'a> Enqueue<'a> {
             // The enum's `#[default]`, not a second copy of it: "reject unless asked" is stated
             // once, where the variants are.
             duplication_policy: DuplicationPolicy::default(),
+            serialization: SerializationFormat::Default,
         }
     }
 
@@ -585,6 +593,7 @@ struct OwnedEnqueue {
     partition_key: Option<String>,
     delay: Option<Duration>,
     duplication_policy: DuplicationPolicy,
+    serialization: SerializationFormat,
 }
 
 impl From<&Enqueue<'_>> for OwnedEnqueue {
@@ -596,6 +605,7 @@ impl From<&Enqueue<'_>> for OwnedEnqueue {
             partition_key: enqueue.partition_key.map(str::to_owned),
             delay: enqueue.delay,
             duplication_policy: enqueue.duplication_policy,
+            serialization: enqueue.serialization,
         }
     }
 }
@@ -615,6 +625,7 @@ impl OwnedEnqueue {
             partition_key: self.partition_key.as_deref(),
             delay: self.delay,
             duplication_policy: self.duplication_policy,
+            serialization: self.serialization,
         }
     }
 }
@@ -1084,12 +1095,20 @@ where
         // the workflow whatever becomes of the task.
         let workflow_id = child_workflow_id(options.workflow_id, placed.parent().as_ref());
         let (executor, placement) = placed.into_parts();
-        let encoding = executor.serializer().encoding();
+        // The registration's choice, unless an enqueue makes its own, and the configured
+        // serializer where neither does. A child does not inherit its parent's: what it is encoded
+        // in is a property of the workflow, not of who started it.
+        let registered =
+            PayloadEncoding::resolve(self.serialization(), executor.serializer().encoding());
+        let encoding = match &options.queue {
+            Some(enqueue) => PayloadEncoding::resolve(enqueue.serialization, registered),
+            None => registered,
+        };
         let request = OwnedStart {
             workflow_id: workflow_id.clone(),
             timeout: options.timeout,
             queue: options.queue.as_ref().map(OwnedEnqueue::from),
-            input: Some(encode(&input, &encoding, "argument")?),
+            input: Some(encode_input(&input, &encoding)?),
             encoding,
             attributes: encode_attributes(options.attributes)?,
             started_at: Timestamp::now(),
@@ -1738,7 +1757,12 @@ pub(crate) fn spawn_execution(
                     );
                     Failure::Control(error)
                 })?;
-                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline);
+                let ctx = Ctx::new(
+                    Arc::clone(&executor),
+                    &workflow_id,
+                    deadline,
+                    encoding.clone(),
+                );
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
@@ -1875,6 +1899,7 @@ async fn execute(
                 key: key.to_string(),
             })
         })?
+        .body
         .clone();
 
     // From the context rather than from a parameter beside it: the deadline is part of what this
@@ -2222,13 +2247,24 @@ mod tests {
         // `async` block returning a future as a missing `.await`, which is exactly what this is:
         // the point is to build the start inside the donor's context and carry it out unpolled.
         #[allow(clippy::async_yields_async)]
-        let smuggled = Ctx::scope(Ctx::new(Arc::clone(&executor), "wf-donor", None), async {
-            child.start(1)
-        })
+        let smuggled = Ctx::scope(
+            Ctx::new(
+                Arc::clone(&executor),
+                "wf-donor",
+                None,
+                crate::serialization::PayloadEncoding::Native,
+            ),
+            async { child.start(1) },
+        )
         .await;
         assert_eq!(smuggled.step_id(), Some(0), "the donor's counter moved");
 
-        let thief = Ctx::new(Arc::clone(&executor), "wf-thief", None);
+        let thief = Ctx::new(
+            Arc::clone(&executor),
+            "wf-thief",
+            None,
+            crate::serialization::PayloadEncoding::Native,
+        );
         match Ctx::scope(thief, smuggled).await {
             Err(Error::StepBuiltElsewhere {
                 step,

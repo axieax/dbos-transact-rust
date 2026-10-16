@@ -15,7 +15,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
-use crate::serialization::{PayloadEncoding, decode, encode};
+use crate::serialization::{
+    PayloadEncoding, SerializationFormat, decode_input, encode, encode_error,
+};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -29,7 +31,8 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// holding only a row, keeps none.
 ///
 /// The [`PayloadEncoding`] is the row's: how the input was encoded, and so how the outcome is
-/// encoded back.
+/// encoded back. It comes from the row rather than from the registration, so a workflow another
+/// language enqueued portably runs portably here whatever this registration would have chosen.
 pub(crate) type ErasedWorkflow = Arc<
     dyn Fn(
             Option<String>,
@@ -38,6 +41,41 @@ pub(crate) type ErasedWorkflow = Arc<
         + Send
         + Sync,
 >;
+
+/// A registration as the registry keeps it: the erased body, and what it was registered with.
+#[derive(Clone)]
+pub(crate) struct RegisteredWorkflow {
+    /// The body, with its types erased.
+    pub(crate) body: ErasedWorkflow,
+    /// How a start of this workflow encodes when the start does not choose, as
+    /// [`WorkflowOptions::serialization`] said. Kept here for the starts that hold no
+    /// [`WorkflowRef`] — a schedule's runs — so they encode as one that did would.
+    pub(crate) serialization: SerializationFormat,
+}
+
+/// How a workflow is registered, beyond its name and its body.
+///
+/// Built by functional update from [`Default`], as [`Config`](crate::Config) is:
+///
+/// ```no_run
+/// # use dbos::{SerializationFormat, WorkflowOptions};
+/// let options = WorkflowOptions {
+///     serialization: SerializationFormat::Portable,
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkflowOptions {
+    /// How a start of this workflow encodes its input, output and error, unless the start
+    /// chooses otherwise.
+    ///
+    /// [`SerializationFormat::Portable`] for a workflow other languages start or await;
+    /// [`SerializationFormat::Default`] takes the configured [`Serializer`](crate::Serializer), and
+    /// [`SerializationFormat::Native`] is `rust_serde` whatever is configured. Whatever this says,
+    /// a start another language enqueued portably runs portably: the row's tag decides how its
+    /// input is read.
+    pub serialization: SerializationFormat,
+}
 
 /// What identifies a workflow, as the `workflow_status` row stores it.
 ///
@@ -139,13 +177,13 @@ pub(crate) struct Registry {
 /// window, because the slot is not what registration races.
 #[derive(Default)]
 struct State {
-    workflows: HashMap<WorkflowKey, ErasedWorkflow>,
+    workflows: HashMap<WorkflowKey, RegisteredWorkflow>,
     /// Set when a snapshot is taken, cleared when the executor it was taken for goes away.
     frozen: bool,
 }
 
 /// A registry frozen at launch.
-pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, ErasedWorkflow>>;
+pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, RegisteredWorkflow>>;
 
 impl Registry {
     /// Registers `workflow` under `key`, refusing a second registration of the same identity.
@@ -155,7 +193,7 @@ impl Registry {
     ///
     /// Refuses outright once frozen. The operation is named here rather than passed in because
     /// registration is the only thing that inserts.
-    fn insert(&self, key: WorkflowKey, workflow: ErasedWorkflow) -> Result<()> {
+    fn insert(&self, key: WorkflowKey, workflow: RegisteredWorkflow) -> Result<()> {
         let mut state = self.write();
         if state.frozen {
             return Err(Error::AlreadyLaunched {
@@ -210,6 +248,8 @@ impl Registry {
 pub struct WorkflowRef<P, R, E = EngineOnly> {
     dbos: DBOS,
     key: Arc<WorkflowKey>,
+    /// How a start writes this workflow unless it chooses otherwise.
+    serialization: SerializationFormat,
     /// `E` is the *application's* error type, the one inside [`Error::Application`], so a workflow
     /// that only fails in DBOS's own terms leaves it at [`EngineOnly`].
     ///
@@ -233,6 +273,11 @@ impl<P, R, E> WorkflowRef<P, R, E> {
     pub(crate) fn dbos(&self) -> &DBOS {
         &self.dbos
     }
+
+    /// How a start writes this workflow when it does not choose.
+    pub(crate) fn serialization(&self) -> SerializationFormat {
+        self.serialization
+    }
 }
 
 /// Hand-written: the derive would demand `P: Clone, R: Clone`, which a reference that holds
@@ -242,6 +287,7 @@ impl<P, R, E> Clone for WorkflowRef<P, R, E> {
         Self {
             dbos: self.dbos.clone(),
             key: Arc::clone(&self.key),
+            serialization: self.serialization,
             types: PhantomData,
         }
     }
@@ -303,25 +349,58 @@ impl DBOS {
         R: Serialize + DeserializeOwned + Send + 'static,
         E: DurableError,
     {
+        self.register_workflow_with(key, WorkflowOptions::default(), workflow)
+    }
+
+    /// [`register_workflow_as`](DBOS::register_workflow_as), with [`WorkflowOptions`].
+    ///
+    /// For a workflow other languages start or await, register it
+    /// [portable](crate::SerializationFormat::Portable):
+    ///
+    /// ```no_run
+    /// # use dbos::{DBOS, SerializationFormat, WorkflowKey, WorkflowOptions};
+    /// # fn example(dbos: &DBOS) -> dbos::Result<()> {
+    /// let greet = dbos.register_workflow_with(
+    ///     WorkflowKey::new("greet"),
+    ///     WorkflowOptions { serialization: SerializationFormat::Portable, ..Default::default() },
+    ///     |name: String| async move { Ok::<_, dbos::Error>(format!("hello, {name}")) },
+    /// )?;
+    /// # Ok(()) }
+    /// ```
+    pub fn register_workflow_with<P, R, E, F, Fut>(
+        &self,
+        key: WorkflowKey,
+        options: WorkflowOptions,
+        workflow: F,
+    ) -> Result<WorkflowRef<P, R, E>>
+    where
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+        P: Serialize + DeserializeOwned + Send + 'static,
+        R: Serialize + DeserializeOwned + Send + 'static,
+        E: DurableError,
+    {
         let workflow = Arc::new(workflow);
         let erased: ErasedWorkflow =
             Arc::new(move |input: Option<String>, encoding: PayloadEncoding| {
                 let workflow = Arc::clone(&workflow);
                 Box::pin(async move {
-                    let input = decode::<P, EngineOnly>(input.as_deref(), &encoding, "argument")
+                    let input = decode_input::<P, EngineOnly>(input.as_deref(), &encoding)
                         .map_err(Failure::Control)?;
                     match workflow(input).await {
+                        // A plain value, in any encoding: only an input and an error have an
+                        // envelope.
                         Ok(output) => encode(&output, &encoding, "result")
                             .map(Some)
                             .map_err(Failure::Control),
-                        // The whole `Error<E>` is what gets recorded, application variant and
-                        // all, so the column is self-describing: a reader knows the envelope
-                        // without having to guess whether the payload is one of ours or one of
-                        // the workflow's.
+                        // Natively the whole `Error<E>` is what gets recorded, application variant
+                        // and all, so the column is self-describing: a reader knows the envelope
+                        // without having to guess whether the payload is one of ours or one of the
+                        // workflow's. Portably it is the envelope every SDK reads.
                         Err(error) => Err(match error.control() {
                             Some(control) => Failure::Control(control),
                             None => Failure::Recorded(EncodedError {
-                                encoded: encode(&error, &encoding, "error")
+                                encoded: encode_error(&error, &encoding)
                                     .map_err(Failure::Control)?,
                                 encoding,
                             }),
@@ -330,11 +409,18 @@ impl DBOS {
                 })
             });
 
-        self.registry().insert(key.clone(), erased)?;
+        self.registry().insert(
+            key.clone(),
+            RegisteredWorkflow {
+                body: erased,
+                serialization: options.serialization,
+            },
+        )?;
         tracing::debug!(workflow = %key, "registered a workflow");
         Ok(WorkflowRef {
             dbos: self.clone(),
             key: Arc::new(key),
+            serialization: options.serialization,
             types: PhantomData,
         })
     }
@@ -382,9 +468,10 @@ mod tests {
         dbos.register_workflow("double", takes_one).unwrap();
 
         let snapshot = dbos.registry().snapshot();
-        let erased = snapshot
+        let erased = &snapshot
             .get(&WorkflowKey::new("double"))
-            .expect("registered");
+            .expect("registered")
+            .body;
         assert_eq!(
             erased(Some("21".to_owned()), PayloadEncoding::Native)
                 .await
@@ -399,9 +486,10 @@ mod tests {
         dbos.register_workflow("nothing", takes_nothing).unwrap();
 
         let snapshot = dbos.registry().snapshot();
-        let erased = snapshot
+        let erased = &snapshot
             .get(&WorkflowKey::new("nothing"))
-            .expect("registered");
+            .expect("registered")
+            .body;
         // The row for a zero-argument workflow has a NULL input; it must not need a `"null"`.
         assert_eq!(
             erased(None, PayloadEncoding::Native).await.unwrap(),
@@ -415,9 +503,10 @@ mod tests {
         dbos.register_workflow("double", takes_one).unwrap();
 
         let snapshot = dbos.registry().snapshot();
-        let erased = snapshot
+        let erased = &snapshot
             .get(&WorkflowKey::new("double"))
-            .expect("registered");
+            .expect("registered")
+            .body;
         let err = erased(Some("\"not a number\"".to_owned()), PayloadEncoding::Native)
             .await
             .unwrap_err();

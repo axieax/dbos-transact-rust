@@ -370,7 +370,12 @@ mod tests {
     }
 
     fn ctx(dbos: &DBOS, id: &str) -> Ctx {
-        Ctx::new(dbos.executor("test").expect("launched"), id, None)
+        Ctx::new(
+            dbos.executor("test").expect("launched"),
+            id,
+            None,
+            crate::serialization::PayloadEncoding::Native,
+        )
     }
 
     /// The ids a workflow's steps were recorded under, and what recorded them.
