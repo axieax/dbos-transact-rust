@@ -16,6 +16,12 @@
 //! **Every read honours the row's tag**, whatever the reader would itself have written. A tag
 //! this process cannot read — neither built-in, nor the name of the serializer it is configured
 //! with — is [`Error::UnknownSerialization`], never a guess.
+//!
+//! **A non-finite float is refused on the way in**, by both built-in encodings. JSON has no way to
+//! write `NaN` or an infinity, and `serde_json` would write `null` in its place, which reads back
+//! as something else. Writing one is [`Error::Serialization`] naming the value. An application
+//! that needs them stores them in its own representation, or uses a [`CustomSerializer`] whose
+//! format has them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,6 +33,9 @@ use serde_json::{Map, Value};
 
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::sysdb::types::EncodedValue;
+
+mod finite;
+use finite::Finite;
 
 /// The tag a [`PayloadEncoding::Native`] row carries.
 pub(crate) const RUST_SERDE: &str = "rust_serde";
@@ -471,7 +480,8 @@ pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
 ///
 /// Native and portable are the same JSON for a plain value — a workflow's output, an event, a
 /// message, a stream value. What they change is the envelope around a workflow's input or error,
-/// which [`encode_input`] and [`encode_error`] add.
+/// which [`encode_input`] and [`encode_error`] add. Both refuse a non-finite float anywhere in the
+/// value, rather than letting `serde_json` write it as `null`.
 pub(crate) fn encode<T: Serialize, E>(
     value: &T,
     encoding: &PayloadEncoding,
@@ -488,7 +498,8 @@ pub(crate) fn encode<T: Serialize, E>(
                 })
         }
         PayloadEncoding::Native | PayloadEncoding::Portable => {
-            serde_json::to_string(value).map_err(|source| Error::encode_failed(what, source))
+            serde_json::to_string(&Finite(value))
+                .map_err(|source| Error::encode_failed(what, source))
         }
     }
 }
@@ -1731,9 +1742,8 @@ mod tests {
         assert_eq!(type_name::<Vec<String>>(), "alloc::vec::Vec");
     }
 
-    /// What `serde_json` does with the portable value rules, which this crate documents rather than
-    /// enforces: an integer key becomes a string, any other non-string key is refused, and a
-    /// non-finite float is `null`.
+    /// What `serde_json` does with the portable value rules: an integer key becomes a string, and
+    /// any other non-string key is refused.
     #[test]
     fn values_follow_serde_json() {
         let map = std::collections::BTreeMap::from([(1u32, "one")]);
@@ -1743,9 +1753,95 @@ mod tests {
         );
         let tuple_keys = std::collections::BTreeMap::from([((1u32, 2u32), "pair")]);
         assert!(encode::<_, EngineOnly>(&tuple_keys, &PayloadEncoding::Native, "value").is_err());
-        assert_eq!(
-            encode::<_, EngineOnly>(&f64::NAN, &PayloadEncoding::Native, "value").unwrap(),
-            "null"
+    }
+
+    /// A non-finite float is refused wherever it is in the value, by both built-in encodings,
+    /// rather than written as a `null` that reads back as something else. The error names the
+    /// value being written.
+    #[test]
+    fn a_non_finite_float_is_refused() {
+        #[derive(Serialize)]
+        struct Reading {
+            name: &'static str,
+            value: Option<f64>,
+        }
+        #[derive(Serialize)]
+        enum Sample {
+            Point(f32),
+            Range { low: f64, high: f64 },
+        }
+
+        fn refused<T: Serialize>(value: &T, encoding: &PayloadEncoding) {
+            let error = encode::<_, EngineOnly>(value, encoding, "result")
+                .expect_err("a non-finite float was written");
+            let Error::Serialization { what, message, .. } = &error else {
+                panic!("not a serialization error: {error}");
+            };
+            assert_eq!(what, "result");
+            assert!(message.contains("not a finite number"), "{message}");
+        }
+
+        for encoding in [PayloadEncoding::Native, PayloadEncoding::Portable] {
+            refused(&f64::NAN, &encoding);
+            refused(&f64::INFINITY, &encoding);
+            refused(&f64::NEG_INFINITY, &encoding);
+            refused(&f32::NAN, &encoding);
+            refused(&vec![1.0, f64::NAN], &encoding);
+            refused(&(1u32, f64::INFINITY), &encoding);
+            refused(
+                &Reading {
+                    name: "t",
+                    value: Some(f64::NAN),
+                },
+                &encoding,
+            );
+            refused(
+                &std::collections::BTreeMap::from([("k", f64::NAN)]),
+                &encoding,
+            );
+            refused(&Sample::Point(f32::INFINITY), &encoding);
+            refused(
+                &Sample::Range {
+                    low: 0.0,
+                    high: f64::INFINITY,
+                },
+                &encoding,
+            );
+
+            // Finite floats, and everything around them, are written as before.
+            assert_eq!(
+                encode::<_, EngineOnly>(
+                    &Reading {
+                        name: "t",
+                        value: Some(1.5),
+                    },
+                    &encoding,
+                    "result"
+                )
+                .unwrap(),
+                r#"{"name":"t","value":1.5}"#
+            );
+            assert_eq!(
+                encode::<_, EngineOnly>(
+                    &Sample::Range {
+                        low: -1.0,
+                        high: 2.0
+                    },
+                    &encoding,
+                    "r"
+                )
+                .unwrap(),
+                r#"{"Range":{"low":-1.0,"high":2.0}}"#
+            );
+            assert_eq!(
+                encode::<_, EngineOnly>(&f64::MAX, &encoding, "result").unwrap(),
+                serde_json::to_string(&f64::MAX).unwrap()
+            );
+        }
+
+        // A workflow input is checked inside the portable envelope too.
+        assert!(
+            encode_input::<_, EngineOnly>(&(1u32, f64::NAN), &PayloadEncoding::Portable).is_err()
         );
     }
 
