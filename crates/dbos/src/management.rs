@@ -1331,9 +1331,13 @@ impl Connection {
     ) -> Result<Vec<String>> {
         let cancelled = self
             .sysdb()
-            .cancel_workflows(workflow_ids, children == Children::Include, caller)
+            .cancel_workflows(
+                workflow_ids,
+                children == Children::Include,
+                self.step_caller(caller),
+            )
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         if !cancelled.is_empty() {
             tracing::info!(cancelled = cancelled.len(), "cancelled workflows");
         }
@@ -1352,9 +1356,9 @@ impl Connection {
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let resumed = self
             .sysdb()
-            .resume_workflows(workflow_ids, options.queue, caller)
+            .resume_workflows(workflow_ids, options.queue, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         // What moved, not what was asked for: an id that had already finished is not
         // re-enqueued, and it still gets a handle below.
         tracing::info!(
@@ -1397,9 +1401,9 @@ impl Connection {
             .collect();
         let forked = self
             .sysdb()
-            .fork_workflows(&forks, &sys_options, caller)
+            .fork_workflows(&forks, &sys_options, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
 
         match forked.as_slice() {
             [only] => tracing::info!(forked_id = only, "forked the workflow onto its queue"),
@@ -1425,9 +1429,14 @@ impl Connection {
             queue_partition_key: options.queue_partition_key,
         };
         self.sysdb()
-            .rewind_workflow(workflow_id, options.start_step, &sys_options, caller)
+            .rewind_workflow(
+                workflow_id,
+                options.start_step,
+                &sys_options,
+                self.step_caller(caller),
+            )
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(
             workflow_id,
             start_step = options.start_step,
@@ -1450,9 +1459,13 @@ impl Connection {
     ) -> Result<u64> {
         let deleted = self
             .sysdb()
-            .delete_workflows(workflow_ids, children == Children::Include, caller)
+            .delete_workflows(
+                workflow_ids,
+                children == Children::Include,
+                self.step_caller(caller),
+            )
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         if deleted > 0 {
             tracing::info!(deleted, "deleted workflows");
         }
@@ -1467,9 +1480,9 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
         self.sysdb()
-            .set_workflow_delay(workflow_id, delay, caller)
+            .set_workflow_delay(workflow_id, delay, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         // Phrased as the request rather than the effect. The statement is guarded on the row
         // still being `DELAYED` and reports no count, so this call cannot tell a workflow that
         // was rescheduled from one that had already been released — unlike `cancel_all` and
@@ -1491,9 +1504,9 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
         self.sysdb()
-            .update_workflow_attributes(workflow_id, encoded, caller)
+            .update_workflow_attributes(workflow_id, encoded, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
         // reaches here indistinguishable from one whose attributes were replaced.
         tracing::info!(workflow_id, "asked to replace the workflow's attributes");
@@ -1507,9 +1520,9 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<WorkflowRecord>> {
         self.sysdb()
-            .list_workflows(filter, caller)
+            .list_workflows(filter, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_sysdb)
     }
 
     /// Reads the steps one workflow has recorded, in the order it recorded them.
@@ -1525,10 +1538,10 @@ impl Connection {
                 options.load_output,
                 options.limit,
                 options.offset,
-                caller,
+                self.step_caller(caller),
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_sysdb)
     }
 }
 
