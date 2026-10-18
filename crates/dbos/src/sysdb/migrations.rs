@@ -412,6 +412,16 @@ sources![
         "121_notifications_consumed_by_function_id.sql",
         Applies::Always
     ),
+    (
+        122,
+        "122_add_workflow_status_deadline_index.sql",
+        Applies::Always
+    ),
+    (
+        123,
+        "123_add_workflow_status_creator_xid.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -717,9 +727,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 76 files: 75 the runner applies, plus the migration-10 probe, which is bound
+        // 78 files: 77 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 75);
+        assert_eq!(SOURCES.len(), 77);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -795,7 +805,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 74, "expected 74 files to carry a numbered header");
+        assert_eq!(checked, 76, "expected 76 files to carry a numbered header");
     }
 
     #[test]
@@ -808,7 +818,7 @@ mod tests {
             online,
             [
                 22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47, 107, 111, 114, 115,
-                116, 117, 118, 119, 120
+                116, 117, 118, 119, 120, 122
             ],
         );
         // 106 is the counterexample in the shared series: an index whose predicate matches
