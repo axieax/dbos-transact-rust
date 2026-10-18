@@ -773,7 +773,10 @@ async fn application_version_indexes_have_the_shared_keys() {
         .unwrap();
     let migrations = build_migrations(schema, dialect_for(db.backend()), true);
     apply_all(&pool, schema, &migrations).await;
-    let late: Vec<Migration> = migrations.into_iter().filter(|m| m.version >= 124).collect();
+    let late: Vec<Migration> = migrations
+        .into_iter()
+        .filter(|m| m.version >= 124)
+        .collect();
     apply_all(&pool, schema, &late).await;
     let definitions: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 \
