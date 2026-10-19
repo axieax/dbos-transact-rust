@@ -21,8 +21,8 @@ use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
-    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
-    WorkflowInitResult,
+    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCaller, StepTiming,
+    Submission, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -424,6 +424,10 @@ pub enum DuplicationPolicy {
     /// The default, and what every implementation defaults to. A caller who did not think about
     /// collisions should hear that the key was taken, rather than silently joining a workflow
     /// whose arguments are somebody else's.
+    ///
+    /// **Started from inside a workflow, the error is recorded at the parent's step**, so a replay
+    /// of the parent gets the same error and starts nothing, even once the holder has finished and
+    /// the key is free.
     #[default]
     Reject,
     /// Hand back a handle to the workflow already holding the key.
@@ -1203,10 +1207,10 @@ async fn create<R, E>(
     // outside one is unaffected by everything below.
     let parent = placed.parent();
 
-    // The launch is recorded against the parent before anything is created, so a replay of
-    // this position finds the child it already started instead of starting a second one.
+    // A replay of this position finds the child it already started, or the error its start
+    // returned, instead of trying the start again.
     if let Some(parent) = &parent
-        && let Some(child) = parent.recorded_child(executor, &key.name).await?
+        && let Some(child) = parent.check_child(executor, &key.name).await?
     {
         tracing::debug!(
             parent_workflow_id = parent.workflow_id(),
@@ -1307,9 +1311,22 @@ async fn create<R, E>(
             started_at,
         }),
     )
-    .await?
+    .await
     {
-        Submitted::Created(initialized) => initialized,
+        Ok(Submitted::Created(initialized)) => initialized,
+        // **The start's error is recorded at the parent's step**, so a replay gets it too. See
+        // [`should_record_start_error`] for which errors, and why each one needs the record.
+        Err(Error::SystemDatabase(error)) if should_record_start_error(&error) => {
+            return Err(match &parent {
+                Some(parent) => {
+                    parent
+                        .record_start_error(executor, error, &key.name, started_at)
+                        .await
+                }
+                None => Error::SystemDatabase(error),
+            });
+        }
+        Err(error) => return Err(error),
         // **The start records the workflow that was joined**, not the id this call derived,
         // so a replay of this position resolves to the same workflow instead of trying to
         // start a child that was never created. Go records the same mapping at the same
@@ -1324,7 +1341,7 @@ async fn create<R, E>(
         // again. It joins the same holder if the key is still held, and starts a workflow of
         // its own if the holder has since finished — which is what the policy means at that
         // moment, since the key deduplicates a backlog rather than a history.
-        Submitted::Joined(holder) => {
+        Ok(Submitted::Joined(holder)) => {
             if let Some(parent) = &parent {
                 parent
                     .record_child(executor, &holder, &key.name, started_at)
@@ -1619,6 +1636,57 @@ impl StartPlacement {
     }
 }
 
+/// Whether a child start's `error` is recorded at the parent's step, so a replay gets the same
+/// error rather than trying the start again.
+///
+/// Each of these depends on another workflow's row, which can be gone by the time of a replay:
+///
+/// - [`QueueDeduplicated`](crate::sysdb::Error::QueueDeduplicated): the key is held only while its
+///   holder waits, so once the holder finishes the same start would go ahead.
+/// - [`ConflictingWorkflow`](crate::sysdb::Error::ConflictingWorkflow): the chosen child id names a
+///   workflow of another function, class or config, and once that row is deleted the same start
+///   would go ahead.
+///
+/// Without the record, the replay would start the child and the parent would take the other branch
+/// from the one it took after the error. Every other error a start can return is one of:
+///
+/// - an error that depends only on the start's own arguments, and so replays the same without a
+///   record;
+/// - database trouble, which a replay should meet afresh;
+/// - a signal about this execution (cancelled, superseded, replaying changed code), which ends the
+///   run rather than answering the start.
+///
+/// [`MaxRecoveryAttemptsExceeded`](crate::sysdb::Error::MaxRecoveryAttemptsExceeded) is the one
+/// exception: a chosen child id naming an unfinished row that another attempt owns and that is
+/// already over its recovery limit parks that row and returns this error, and a replay then finds
+/// the row parked and joins it. It is not recorded, because a start that is not a dequeue should
+/// not count recovery attempts at all.
+fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
+    matches!(
+        error,
+        crate::sysdb::Error::QueueDeduplicated { .. }
+            | crate::sysdb::Error::ConflictingWorkflow { .. }
+    )
+}
+
+/// The variants [`should_record_start_error`] accepts, by the name a recorded one is stored under.
+///
+/// A [`sysdb::Error`](crate::sysdb::Error) is stored as an object whose one key is its variant's
+/// name, so [`check_child`](Parent::check_child) can tell a recorded start error from a plain
+/// step's error by that key, before reading it as the type. A unit test keeps this list and the
+/// predicate in step.
+const RECORDED_START_ERRORS: [&str; 2] = ["QueueDeduplicated", "ConflictingWorkflow"];
+
+/// Whether `value`, a recorded step error, has the shape of a recorded start error.
+fn is_recorded_start_error(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object
+                .keys()
+                .all(|key| RECORDED_START_ERRORS.contains(&key.as_str()))
+    })
+}
+
 /// The workflow a child is being started from: the context it runs in, and the step id the start
 /// occupies.
 ///
@@ -1646,16 +1714,18 @@ impl Parent<'_> {
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
     /// [`UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this sees it. What is left
-    /// to check is the child id: a row under the right name carrying none was written by a plain
-    /// step, which means the parent's code changed — `step("charge")` became a child workflow
-    /// named `charge` — and starting a child now would give this position two meanings across
-    /// two runs.
+    /// is what the row holds:
     ///
-    /// **Stricter than the references here.** Python falls through to a fresh start when the
-    /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
-    /// up loud rather than wrong — the write conflicts a moment later — but only after a child row
-    /// has been created and orphaned, which is a worse thing to leave behind than an error.
-    async fn recorded_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
+    /// - **a child id**: the start went ahead, and the replay joins that child;
+    /// - **a recorded error**: the start failed, and the replay returns the same error without
+    ///   trying the start again. See [`record_start_error`](Self::record_start_error);
+    /// - **a recorded error this build can't decode**, or a recorded start error it can't read
+    ///   as one: the decode error, naming this step;
+    /// - **neither**, or an error that [`should_record_start_error`] doesn't name: a plain step
+    ///   wrote the row, which means the parent's code changed (`step("charge")` became a child
+    ///   workflow named `charge`), and starting a child now would give this position two meanings
+    ///   across two runs.
+    async fn check_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
         let Some(recorded) = executor
             .sysdb()
             .check_step(self.workflow_id(), self.step_id, step_name)
@@ -1664,14 +1734,107 @@ impl Parent<'_> {
         else {
             return Ok(None);
         };
-        recorded.child_workflow_id.map(Some).ok_or_else(|| {
-            Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
-                workflow_id: self.workflow_id().to_owned(),
+        if let Some(child) = recorded.child_workflow_id {
+            return Ok(Some(child));
+        }
+        if let Some(encoded) = recorded.error.as_deref() {
+            let caller = StepCaller {
+                workflow_id: self.workflow_id(),
                 step_id: self.step_id,
-                expected: format!("a child workflow start of {step_name}"),
-                recorded: format!("a plain step named {step_name}"),
-            })
-        })
+                codec: executor.serializer(),
+            };
+            let value: serde_json::Value =
+                decode_step_value(&recorded, encoded, caller, step_name, "an error")
+                    .map_err(Error::SystemDatabase)?;
+            // Told apart by shape before the typed read, so a start error this build can't read
+            // is reported as that, naming the step, rather than as a plain step's row.
+            if is_recorded_start_error(&value) {
+                let error = serde_json::from_value::<crate::sysdb::Error>(value).map_err(|e| {
+                    Error::SystemDatabase(crate::sysdb::Error::Malformed(format!(
+                        "workflow {} step {} ({step_name}) has an error this build cannot read: \
+                         {e}",
+                        self.workflow_id(),
+                        self.step_id,
+                    )))
+                })?;
+                tracing::debug!(
+                    parent_workflow_id = self.workflow_id(),
+                    step_id = self.step_id,
+                    %error,
+                    "the child workflow start failed; the replay returns the same error"
+                );
+                return Err(Error::SystemDatabase(error));
+            }
+        }
+        Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+            workflow_id: self.workflow_id().to_owned(),
+            step_id: self.step_id,
+            expected: format!("a child workflow start of {step_name}"),
+            recorded: format!("a plain step named {step_name}"),
+        }))
+    }
+
+    /// Records a failed start's error at this position, and gives back the error the caller
+    /// should see.
+    ///
+    /// The insert that failed wrote nothing, so the record goes in on its own. A crash before
+    /// it leaves nothing recorded and nothing observed, and the replay tries the start again as a
+    /// first run would.
+    ///
+    /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
+    ///   returns it again on a replay.
+    /// - **The record fails**: that failure is returned instead, and the position usually stays
+    ///   unrecorded. A rival that recorded it first is
+    ///   [`StepAlreadyRecorded`](crate::sysdb::Error::StepAlreadyRecorded): this execution is
+    ///   superseded. The record is the step row and then the executor claim, as for any step; if
+    ///   the claim fails after the row lands, the caller gets the claim's error but the row stays,
+    ///   so a replay returns the recorded error. The claim's error is database trouble, which
+    ///   leaves the parent `PENDING` rather than ending it.
+    /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
+    ///   encoding failure is returned and the error logged, so the position stays unrecorded
+    ///   rather than the parent acting on an answer nothing recorded.
+    async fn record_start_error(
+        &self,
+        executor: &Executor,
+        error: crate::sysdb::Error,
+        step_name: &str,
+        started_at: Timestamp,
+    ) -> Error {
+        let recorded = match encode_step_value(&error, executor.serializer(), "an error") {
+            Ok(recorded) => recorded,
+            Err(encode_error) => {
+                tracing::warn!(
+                    parent_workflow_id = self.workflow_id(),
+                    step_id = self.step_id,
+                    %error,
+                    %encode_error,
+                    "the child workflow start failed, but its error could not be encoded \
+                     to record it"
+                );
+                return Error::SystemDatabase(encode_error);
+            }
+        };
+        // Read once, outside the retry inside `record_step`, so a retried write carries the same
+        // completion time and is recognised as this call's own.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+        match executor
+            .sysdb()
+            .record_step(
+                self.workflow_id(),
+                self.step_id,
+                step_name,
+                Outcome::Error(&recorded.value),
+                recorded.serialization.as_deref(),
+                Some(timing),
+            )
+            .await
+        {
+            Ok(()) => Error::SystemDatabase(error),
+            Err(record_error) => Error::SystemDatabase(record_error),
+        }
     }
 
     /// Records the start, so the replay above finds it — for the **joined** case alone.
@@ -2090,6 +2253,43 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The names [`check_child`](Parent::check_child) recognises a recorded start error by are the
+    /// variants [`should_record_start_error`] records, and no others.
+    #[test]
+    fn the_recorded_start_error_names_match_the_errors_that_are_recorded() {
+        let errors = [
+            crate::sysdb::Error::QueueDeduplicated {
+                workflow_id: "w".to_owned(),
+                queue_name: "q".to_owned(),
+                deduplication_id: "d".to_owned(),
+            },
+            crate::sysdb::Error::ConflictingWorkflow {
+                workflow_id: "w".to_owned(),
+                detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::InvalidInput {
+                field: "f".into(),
+                detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::NonExistentWorkflow {
+                workflow_ids: vec!["w".to_owned()],
+            },
+        ];
+        for error in &errors {
+            let value = serde_json::to_value(error).unwrap();
+            assert_eq!(
+                is_recorded_start_error(&value),
+                should_record_start_error(error),
+                "{value}"
+            );
+        }
+        let recorded = errors
+            .iter()
+            .filter(|error| should_record_start_error(error))
+            .count();
+        assert_eq!(recorded, RECORDED_START_ERRORS.len());
+    }
 
     /// A subscriber that keeps every event's level and message, and nothing else.
     ///

@@ -1950,6 +1950,75 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
     fn decode(&self, value: &str, serialization: Option<&str>) -> Result<serde_json::Value, Error>;
 }
 
+/// Encodes a value to record as a step's output or error, through the caller's codec. `what` names
+/// the value for the failure message: `an output` or `an error`. The reverse of
+/// [`decode_step_value`].
+///
+/// Every value this crate records through a [`StepCodec`] goes through here (a management call's
+/// result, an internal step's output, a recorded system-database error), so a replay reads them all
+/// back the same way. An ordinary step's output and error are the application's own types, and go
+/// through the payload encoding instead.
+///
+/// `serde_json` fails only on a type that cannot be JSON, such as a non-string map key, and turns a
+/// non-finite float into `null` without failing, so a value here must hold none; every value this
+/// takes is one of the engine's own plain records or an [`Error`]. The codec can fail too, since a
+/// custom serializer may fail for its own reasons.
+pub(crate) fn encode_step_value<T: serde::Serialize + ?Sized>(
+    value: &T,
+    codec: &dyn StepCodec,
+    what: &str,
+) -> Result<EncodedValue, Error> {
+    let value = serde_json::to_value(value)
+        .map_err(|e| Error::Malformed(format!("{what} to record is not JSON: {e}")))?;
+    codec.encode(value)
+}
+
+/// Reads one of `step`'s recorded values back through the caller's codec, by the tag the row was
+/// stored under, and says which step it came from if it cannot. `what` names the value for that
+/// message: `an error` or `an output`.
+///
+/// The codec and serde don't know which step they are reading, so a failure gets that here:
+///
+/// - [`Error::UnknownSerialization`] is returned as it is, because callers match on it and it names
+///   only the tag. The step that holds it is logged instead.
+/// - [`Error::Malformed`] gets the step in its message.
+/// - Any other error, such as one a custom serializer's decode returns, is returned unchanged.
+pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
+    step: &StepRecord,
+    recorded: &str,
+    caller: StepCaller<'_>,
+    step_name: &str,
+    what: &str,
+) -> Result<T, Error> {
+    let StepCaller {
+        workflow_id,
+        step_id,
+        codec,
+    } = caller;
+    codec
+        .decode(recorded, step.serialization.as_deref())
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
+        })
+        .map_err(|error| match error {
+            Error::UnknownSerialization { ref name } => {
+                tracing::warn!(
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    serialization = %name,
+                    "a recorded step holds {what} under a serialization this process cannot read"
+                );
+                error
+            }
+            Error::Malformed(detail) => Error::Malformed(format!(
+                "workflow {workflow_id} step {step_id} ({step_name}) has {what} this build cannot \
+                 read: {detail}"
+            )),
+            other => other,
+        })
+}
+
 /// The workflow step a management call runs as, and how its result is recorded.
 ///
 /// What the methods that record their own result take, where the plain-id methods take `caller:

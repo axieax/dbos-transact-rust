@@ -387,6 +387,271 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
     dbos.shutdown().await;
 }
 
+/// **A deduplicated child start's error is recorded at the parent's step, and replays the same.**
+///
+/// The key is held only while its holder waits, so a replay after the holder has finished would
+/// otherwise start the child and take the branch the first run didn't. The parent handles the
+/// error; the holder then finishes; a fork that copies the start's checkpoint still takes the
+/// error branch and creates no child. A fork that runs the start again, as a control, starts the
+/// child, which shows the key really is free by then.
+#[tokio::test]
+async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-dedup-error-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let started = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    deduplication_id: Some("order-7"),
+                                    ..Enqueue::new("dedup-error-queue")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    match started {
+                        Ok(handle) => Ok::<_, Error>(format!("started {}", handle.result().await?)),
+                        Err(
+                            e @ Error::SystemDatabase(dbos::sysdb::Error::QueueDeduplicated {
+                                ..
+                            }),
+                        ) => Ok(format!("deduplicated: {e}")),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // **Enqueued before the queue is registered, which is what keeps the key held.** Nothing polls
+    // a queue until it is registered, so the holder waits, holding the key, for as long as the
+    // parent's first run takes.
+    let holder = child
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("the-dedup-holder"),
+                queue: Some(Enqueue {
+                    deduplication_id: Some("order-7"),
+                    ..Enqueue::new("dedup-error-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the holder was not enqueued");
+
+    let id = "the-deduplicated-parent";
+    let first = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert!(first.starts_with("deduplicated: "), "{first}");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "child");
+    assert!(
+        steps[0].error.is_some() && steps[0].child_workflow_id.is_none(),
+        "the error is recorded as the start's, with no child: {:?}",
+        steps[0]
+    );
+
+    // Registering the queue lets the holder run, and its finishing frees the key.
+    dbos.register_queue(
+        "dedup-error-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), holder.result())
+            .await
+            .expect("the holder never ran")
+            .expect("the holder failed"),
+        9
+    );
+
+    // The key is free now. A fork from step 1 copies the start's checkpoint, so the start replays
+    // and must return the first run's error again rather than start the child: the same variant
+    // and fields, so it still names the first run's derived child id.
+    let replayed = dbos
+        .fork::<String, Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed_id = replayed.workflow_id().to_owned();
+    assert_eq!(
+        replayed.result().await.expect("the replay failed"),
+        first,
+        "the replay took a different branch from the run it replayed"
+    );
+    assert!(
+        reader
+            .get_workflow(&format!("{replayed_id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
+    );
+
+    // A fork from step 0 runs the start again, and with the key free it goes ahead.
+    let rerun = dbos
+        .fork::<String, Error>(id, 0)
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), rerun.result())
+            .await
+            .expect("the rerun never finished")
+            .expect("the rerun failed"),
+        "started 9"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A child id taken by another function is a recorded error too**, and a parent that returns it
+/// with `?` ends `ERROR` with it, on the first run and on the replay.
+///
+/// The conflict lasts only as long as the other workflow's row. Once that row is deleted the same
+/// start would go ahead, so a replay that didn't read the record would start the child and
+/// end in success.
+#[tokio::test]
+async fn a_child_id_taken_by_another_function_replays_its_error_after_the_row_is_deleted() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-conflict-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    let squatter = dbos
+        .register_workflow("squatter", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                workflow_id: Some("the-taken-child-id"),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await?
+                        .result()
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    squatter
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("the-taken-child-id"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the squatter failed");
+
+    let id = "the-conflicting-parent";
+    let first = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start")
+        .result()
+        .await
+        .expect_err("the parent should end with the error");
+    assert!(
+        matches!(
+            first,
+            Error::SystemDatabase(dbos::sysdb::Error::ConflictingWorkflow { .. })
+        ),
+        "{first:?}"
+    );
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the parent is missing")
+            .status,
+        WorkflowStatus::Error,
+        "a recorded start error returned with `?` is the workflow's outcome"
+    );
+
+    // With the squatter gone the id is free, so only the record keeps the replay failing.
+    dbos.delete("the-taken-child-id")
+        .await
+        .expect("delete failed");
+    let fork = dbos.fork::<u32, Error>(id, 1).await.expect("fork failed");
+    let fork_id = fork.workflow_id().to_owned();
+    let replayed = fork
+        .result()
+        .await
+        .expect_err("the replay should end with the error");
+    assert_eq!(
+        replayed.to_string(),
+        first.to_string(),
+        "the replay ended differently from the run it replayed"
+    );
+    assert_eq!(
+        reader
+            .get_workflow(&fork_id)
+            .await
+            .expect("read failed")
+            .expect("the fork is missing")
+            .status,
+        WorkflowStatus::Error,
+        "the replay's recorded start error is its outcome too"
+    );
+    assert!(
+        reader
+            .get_workflow("the-taken-child-id")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **The acceptance test.** A parent that dies between its children adopts the ones it already
 /// started rather than starting a second set.
 ///
