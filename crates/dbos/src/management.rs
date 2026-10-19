@@ -212,6 +212,27 @@ pub struct ForkOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
+    /// Children to swap in as the fork's steps are copied, as `(original, replacement)` pairs.
+    ///
+    /// Every copied step that names child `original` is rewritten to name `replacement`. This is
+    /// how a fork picks up a corrected child: re-run the failed child (often by forking it), then
+    /// fork the parent from the step that awaits it, mapping the old child to the new one. The
+    /// fork replays the step that started the child, now naming the replacement, then waits on
+    /// the replacement and carries on with its result. The steps before it don't run again.
+    ///
+    /// **Only the id is rewritten, never a recorded result.** Steps below the start step are
+    /// copied, and a copied step that already awaited `original` keeps the result it recorded,
+    /// now under the replacement's id. So start the fork at the step that awaits the child, or
+    /// earlier: a fork that starts after it returns the original's result. From the start step
+    /// on, the fork runs as usual and starts its own children.
+    ///
+    /// An `original` no copied step names changes nothing. The fork doesn't create
+    /// `replacement`: it must exist by the time the fork waits on it.
+    /// [`fork_all`](DBOS::fork_all) applies the pairs to every fork.
+    ///
+    /// Each `original` may appear once. Naming one twice, or giving an empty id on either side,
+    /// fails with [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is forked.
+    pub replacement_children: &'a [(&'a str, &'a str)],
 }
 
 /// Where a rewind cuts a workflow's history, and where the rewound workflow goes.
@@ -1150,7 +1171,8 @@ impl crate::Client {
             .await
     }
 
-    /// [`fork`](Self::fork), with the version, queue, timeout and chosen id spelled out.
+    /// [`fork`](Self::fork), with the version, queue, timeout, chosen id and replacement children
+    /// spelled out.
     pub async fn fork_with<R, E>(
         &self,
         workflow_id: &str,
@@ -1388,7 +1410,7 @@ impl Connection {
             queue_name: options.queue,
             queue_partition_key: options.queue_partition_key,
             timeout: options.timeout,
-            replacement_children: &[],
+            replacement_children: options.replacement_children,
         };
 
         let forks: Vec<Fork<'_>> = workflow_ids
