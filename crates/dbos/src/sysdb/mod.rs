@@ -466,6 +466,34 @@ pub trait SystemDatabase: Send + Sync {
     /// version predates the column.
     async fn transition_delayed_workflows(&self) -> Result<u64, Error>;
 
+    /// Cancels up to `limit` unsettled workflows whose deadline has passed, oldest deadline first,
+    /// returning the ids it cancelled.
+    ///
+    /// The workflow-timeout sweep, which every executor of an application runs. It matches on each
+    /// row's own deadline, whoever owns the row and whichever unsettled status it is in, so a
+    /// workflow nobody is running still times out: an `ENQUEUED` or `DELAYED` one no worker has
+    /// claimed, or a `PENDING` one whose executor died. Scoped to this application's rows and
+    /// unclaimed ones, like the other sweeps.
+    ///
+    /// - **Clears what a cancel clears**, plus `owner_xid`, so no execution still holds the row.
+    /// - **Children are not cascaded.** A child that inherited its parent's deadline holds the same
+    ///   instant and is swept with it; one with its own budget or none is left alone.
+    /// - **Rows another transaction has locked are skipped**, such as one a dequeue is claiming or
+    ///   a peer's sweep is cancelling, and left to the next pass.
+    ///
+    /// The deadline is compared against the database's clock, so every executor sweeping the same
+    /// rows agrees on when a deadline has passed.
+    async fn cancel_timed_out_workflows(&self, limit: i64) -> Result<Vec<String>, Error>;
+
+    /// Cancels one workflow if it is unsettled and the database's clock has passed its deadline,
+    /// reporting whether it did.
+    ///
+    /// What an execution whose local timer has fired uses, so its timeout doesn't depend on the
+    /// sweep reaching the row. It writes what
+    /// [`cancel_timed_out_workflows`](Self::cancel_timed_out_workflows) writes, and decides
+    /// expiry on the same clock.
+    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
+
     /// Cancels workflows, returning the ids that actually moved.
     ///
     /// A workflow that has already finished is left alone rather than reported as an error —
