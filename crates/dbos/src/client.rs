@@ -183,6 +183,12 @@ pub struct ClientConfig {
     ///
     /// `None` is ten milliseconds; `Some(Duration::ZERO)` turns coalescing off.
     pub notification_coalesce: Option<Duration>,
+
+    /// How long a system-database connection may sit idle inside an open transaction before the
+    /// server ends its session.
+    ///
+    /// Sixty seconds by default; see [`IdleTransactionTimeout`](crate::IdleTransactionTimeout).
+    pub idle_transaction_timeout: crate::IdleTransactionTimeout,
 }
 
 impl ClientConfig {
@@ -202,6 +208,7 @@ impl ClientConfig {
             polling_concurrency: crate::PollingConcurrency::Default,
             outcome_poll_interval: None,
             notification_coalesce: None,
+            idle_transaction_timeout: crate::IdleTransactionTimeout::Default,
         }
     }
 
@@ -262,6 +269,9 @@ impl ClientConfig {
                 "`outcome_poll_interval` cannot be zero".to_owned(),
             ));
         }
+        self.idle_transaction_timeout
+            .validate()
+            .map_err(|error| crate::Error::Config(error.to_string()))?;
         Ok(())
     }
 

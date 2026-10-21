@@ -1476,6 +1476,65 @@ pub struct ApplicationRowCounts {
     pub steps: u64,
 }
 
+/// How long a system-database connection may sit idle inside an open transaction before the
+/// server ends its session, as `idle_in_transaction_session_timeout`.
+///
+/// A process that stalls mid-transaction (a frozen container, a network partition) would otherwise
+/// hold the transaction's row locks, and the connection, for as long as the stall lasts.
+///
+/// **Connection options that already set the parameter keep their own** (the database URL's
+/// `options` parameter, or `PGOPTIONS`), whatever this says. Otherwise [`Default`](Self::Default)
+/// and [`After`](Self::After) replace the server's setting, one made with `ALTER ROLE` or
+/// `ALTER DATABASE` included, and [`ServerSetting`](Self::ServerSetting) leaves it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdleTransactionTimeout {
+    /// [`IdleTransactionTimeout::DEFAULT`], sixty seconds.
+    #[default]
+    Default,
+    /// Whatever the server is set to, which may be no timeout at all.
+    ServerSetting,
+    /// After this long: more than zero, and at most [`IdleTransactionTimeout::MAX`]. A positive
+    /// value under a millisecond is a millisecond, the server's unit.
+    After(Duration),
+}
+
+impl IdleTransactionTimeout {
+    /// What [`Default`](Self::Default) is.
+    pub const DEFAULT: Duration = Duration::from_secs(60);
+
+    /// The longest timeout the server takes: the parameter is a 32-bit count of milliseconds,
+    /// about 24.8 days.
+    pub const MAX: Duration = Duration::from_millis(i32::MAX as u64);
+
+    /// Rejects an [`After`](Self::After) the server can't take: zero, or longer than
+    /// [`MAX`](Self::MAX).
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        let detail = match self {
+            IdleTransactionTimeout::After(timeout) if timeout.is_zero() => {
+                "must be more than zero; `ServerSetting` leaves the server's setting".to_owned()
+            }
+            IdleTransactionTimeout::After(timeout) if *timeout > Self::MAX => {
+                format!("must be at most {:?}", Self::MAX)
+            }
+            _ => return Ok(()),
+        };
+        Err(Error::InvalidInput {
+            field: "idle_transaction_timeout".into(),
+            detail,
+        })
+    }
+
+    /// The timeout to set on a connection, in the server's milliseconds, or `None` to leave the
+    /// server's setting.
+    pub(crate) fn millis(self) -> Option<u128> {
+        match self {
+            IdleTransactionTimeout::Default => Some(Self::DEFAULT.as_millis()),
+            IdleTransactionTimeout::ServerSetting => None,
+            IdleTransactionTimeout::After(timeout) => Some(timeout.as_millis().max(1)),
+        }
+    }
+}
+
 /// How many polling reads may run at once against a system database's pool.
 ///
 /// Every wait is a loop that re-queries the database, and each pass takes a connection. Uncapped,

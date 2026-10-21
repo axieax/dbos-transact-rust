@@ -85,12 +85,12 @@ use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
     Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
-    ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
-    NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency, QueueRecord, QueueUpdate,
-    RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord,
-    ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord,
-    Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
+    NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
+    StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
@@ -151,6 +151,7 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `57…` | operator intervention — shutdown, cannot connect now | connection |
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
+/// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -197,6 +198,12 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
 fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
     if matches!(code, "40001" | "40P01") {
         return BackendErrorKind::Conflict;
+    }
+    // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
+    // transaction. The transaction rolled back with it, so asking again on a new connection is
+    // what a lost connection would ask for.
+    if code == "25P03" {
+        return BackendErrorKind::Connection;
     }
     match &code[..2.min(code.len())] {
         "08" | "53" | "57" => BackendErrorKind::Connection,
@@ -318,6 +325,9 @@ pub struct Config<'a> {
     /// permanent and affects every application sharing the database — see the note on
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
+    /// How long a connection may sit idle inside an open transaction before the server ends its
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens.
+    pub idle_transaction_timeout: IdleTransactionTimeout,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
     /// On by default. Turning it off suits an application whose database is migrated by something
@@ -335,10 +345,69 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
+            idle_transaction_timeout: IdleTransactionTimeout::Default,
             migrate: true,
             settings: Settings::default(),
         }
     }
+}
+
+/// Whether the connection options `url` resolves to already set
+/// `idle_in_transaction_session_timeout`: the URL's `options` parameter, in either of its forms,
+/// or `PGOPTIONS`, decoded. A URL that does not parse sets nothing here, and fails at connect.
+fn options_set_idle_transaction_timeout(url: &str) -> bool {
+    url.parse::<sqlx::postgres::PgConnectOptions>()
+        .ok()
+        .and_then(|options| {
+            options
+                .get_options()
+                .map(|options| option_names(options).any(|name| name == IDLE_TIMEOUT_PARAMETER))
+        })
+        .unwrap_or(false)
+}
+
+const IDLE_TIMEOUT_PARAMETER: &str = "idle_in_transaction_session_timeout";
+
+/// The parameter names a libpq `options` string assigns, as the server reads them: split on
+/// unescaped whitespace (a backslash escapes the next character), each assignment either `-c`
+/// followed by `name=value`, `-cname=value`, or `--name=value`, and the name compared lowercased
+/// with dashes as underscores. Anything else, a value included, names nothing.
+fn option_names(options: &str) -> impl Iterator<Item = String> + '_ {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => word.extend(chars.next()),
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut words = words.into_iter();
+    std::iter::from_fn(move || {
+        loop {
+            let word = words.next()?;
+            let assignment = if word == "-c" {
+                words.next()?
+            } else if let Some(rest) = word.strip_prefix("--") {
+                rest.to_owned()
+            } else if let Some(rest) = word.strip_prefix("-c") {
+                rest.to_owned()
+            } else {
+                continue;
+            };
+            if let Some((name, _)) = assignment.split_once('=') {
+                return Some(name.to_ascii_lowercase().replace('-', "_"));
+            }
+        }
+    })
 }
 
 /// A system database backed by PostgreSQL or CockroachDB.
@@ -416,16 +485,31 @@ impl PostgresSystemDatabase {
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
     pub async fn connect(config: &Config<'_>) -> Result<Self, Error> {
+        // Before anything touches the server, so a bad setting creates no database.
+        config.idle_transaction_timeout.validate()?;
+
         // Only when migrating. A caller that has opted out is saying the database is someone
         // else's to set up, and creating one here would hide the fact that it is missing.
         if config.migrate {
             ensure_database_exists(config.url).await?;
         }
 
-        let pool = PgPoolOptions::new()
-            .max_connections(config.max_connections)
-            .connect(config.url)
-            .await?;
+        let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
+        if let Some(millis) = config.idle_transaction_timeout.millis()
+            && !options_set_idle_transaction_timeout(config.url)
+        {
+            pool = pool.after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "SET idle_in_transaction_session_timeout = {millis}"
+                    )))
+                    .execute(conn)
+                    .await?;
+                    Ok(())
+                })
+            });
+        }
+        let pool = pool.connect(config.url).await?;
 
         // Either bring the schema up, or check that whoever was supposed to has. Connecting to a
         // schema this build's queries do not fit is a failure either way; the only question is
@@ -8175,5 +8259,162 @@ mod tests {
             let plan = plan.join("\n");
             assert!(!plan.contains("Seq Scan"), "{kind}: {plan}");
         }
+    }
+
+    /// An idle session ending inside a transaction is a lost connection, and asked again.
+    #[test]
+    fn an_idle_transaction_timeout_is_retried_as_a_lost_connection() {
+        assert_eq!(
+            classify_sqlstate("25P03", None),
+            BackendErrorKind::Connection
+        );
+    }
+
+    /// **`connect` sets the idle-transaction timeout on its connections**: sixty seconds by
+    /// default, a positive value under a millisecond as a millisecond, and the server's own setting
+    /// for `ServerSetting`. Connection options that set it themselves keep their own, however they
+    /// spell it; one that only mentions it in a value doesn't count, and a pool the caller built is
+    /// left alone. Each is compared with the same server's reading of the value set directly, so
+    /// how a backend formats the setting doesn't matter.
+    #[tokio::test]
+    async fn connect_sets_the_idle_transaction_timeout() {
+        use super::IdleTransactionTimeout::{After, Default, ServerSetting};
+        async fn show(pool: &sqlx::PgPool) -> String {
+            sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn connected(url: &str, timeout: super::IdleTransactionTimeout) -> String {
+            let sys = PostgresSystemDatabase::connect(&super::Config {
+                idle_transaction_timeout: timeout,
+                migrate: false,
+                ..super::Config::new(url)
+            })
+            .await
+            .expect("connect failed");
+            show(&sys.pool).await
+        }
+        let db = dbos_test_support::test_database().await;
+        let with = |query: &str| {
+            let separator = if db.url().contains('?') { '&' } else { '?' };
+            format!("{}{separator}{query}", db.url())
+        };
+        // What the server reports for `millis` set directly, on a pool `connect` didn't make.
+        let set_directly = async |millis: u64| {
+            let url = with(&format!(
+                "options=-c%20idle_in_transaction_session_timeout%3D{millis}"
+            ));
+            show(&sqlx::PgPool::connect(&url).await.unwrap()).await
+        };
+        let ms = std::time::Duration::from_millis;
+        let server = show(&db.pool().await).await;
+
+        assert_eq!(
+            connected(db.url(), Default).await,
+            set_directly(60_000).await
+        );
+        assert_eq!(
+            connected(db.url(), After(ms(300))).await,
+            set_directly(300).await
+        );
+        assert_eq!(
+            connected(db.url(), After(std::time::Duration::from_micros(500))).await,
+            set_directly(1).await,
+            "under a millisecond is a millisecond"
+        );
+        assert_eq!(connected(db.url(), ServerSetting).await, server);
+
+        let own = set_directly(1234).await;
+        for options in [
+            "options=-c%20idle_in_transaction_session_timeout%3D1234",
+            "options=-c%20IDLE%5FIN%5FTRANSACTION%5FSESSION%5FTIMEOUT%3D1234",
+            "options=--idle-in-transaction-session-timeout%3D1234",
+        ] {
+            assert_eq!(connected(&with(options), Default).await, own, "{options}");
+        }
+        // Neither of these sets the parameter, so the timeout is set: a bare query parameter is
+        // not a connection option, and a value that names the parameter assigns another one.
+        for query in [
+            "idle_in_transaction_session_timeout=1234",
+            "options=-c%20application_name%3Didle_in_transaction_session_timeout",
+        ] {
+            assert_eq!(
+                connected(&with(query), After(ms(300))).await,
+                set_directly(300).await,
+                "{query}"
+            );
+        }
+
+        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        assert_eq!(
+            show(&supplied.pool).await,
+            server,
+            "a pool the caller built is left alone"
+        );
+    }
+
+    /// The names an `options` string assigns, in each form the server reads, and nothing else.
+    #[test]
+    fn option_names_are_read_as_the_server_reads_them() {
+        let names = |options| super::option_names(options).collect::<Vec<_>>();
+        assert_eq!(
+            names("-c a=1 -cB=2 --c-d=3 -c e\\ f=4"),
+            ["a", "b", "c_d", "e f"]
+        );
+        assert_eq!(
+            names("-c application_name=idle_in_transaction_session_timeout"),
+            ["application_name"]
+        );
+        assert!(names("-B 100 stray -c").is_empty());
+    }
+
+    /// **A transaction left idle is ended by the server**, after the timeout `connect` sets on its
+    /// connections, and the row lock it held goes with it. Checked on PostgreSQL; the setting
+    /// itself is checked on both backends above.
+    #[tokio::test]
+    async fn connect_ends_transactions_left_idle() {
+        let db = dbos_test_support::test_database().await;
+        if db.backend() == dbos_test_support::Backend::Cockroach {
+            return;
+        }
+        let sys = PostgresSystemDatabase::connect(&super::Config {
+            idle_transaction_timeout: super::IdleTransactionTimeout::After(
+                std::time::Duration::from_millis(300),
+            ),
+            migrate: false,
+            ..super::Config::new(db.url())
+        })
+        .await
+        .expect("connect failed");
+
+        sys.init_workflow(&NewWorkflow::new("wf-idle"), None, Submission::Fresh, None)
+            .await
+            .unwrap();
+        let table = sys.tables.workflow_status.as_str();
+        let mut idle = sys.pool.begin().await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "SELECT status FROM {table} WHERE workflow_uuid = 'wf-idle' FOR NO KEY UPDATE"
+        )))
+        .execute(&mut *idle)
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The lock went with the session, so another write goes through at once.
+        let other = db.pool().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET updated_at = updated_at WHERE workflow_uuid = 'wf-idle'"
+            )))
+            .execute(&other),
+        )
+        .await
+        .expect("the idle transaction still holds its lock")
+        .unwrap();
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut *idle).await.is_err(),
+            "the idle transaction's session was ended"
+        );
     }
 }
