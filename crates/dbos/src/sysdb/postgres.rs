@@ -89,7 +89,7 @@ use super::types::{
     NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
     ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
-    StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
     WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
@@ -2988,7 +2988,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
-        submission: Submission,
         caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
@@ -2996,15 +2995,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
         let initial_status = workflow.initial_status();
         // Queued workflows are not running, so neither the attempt counter nor the executor
-        // stamp applies to them — both `CASE` expressions below turn on that distinction.
+        // stamp applies to them: a queued row starts at zero attempts, and the `executor_id`
+        // `CASE` below keeps the stored stamp for one.
         let queued = matches!(
             initial_status,
             WorkflowStatus::Enqueued | WorkflowStatus::Delayed
         );
         let initial_attempts = i64::from(!queued);
-        // A recovery or a dequeue is being told it owns this workflow; a fresh start is not.
-        let claiming = submission.claims_ownership();
-        let increment = i64::from(claiming && !queued);
         // Everything below is generated **outside** the retry, and that is the whole reason the
         // retry is a wrapper rather than a loop around the statement.
         //
@@ -3051,7 +3048,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             //
             // That is the one thing the `INSERT .. ON CONFLICT .. RETURNING` below cannot do on
             // its own, and it costs something: a creation with no caller — a root start, every
-            // enqueue, a dequeue's re-submission — pays a begin and a commit around one statement.
+            // enqueue — pays a begin and a commit around one statement.
             // Opened unconditionally even so, because the two paths would otherwise differ in what
             // a failure part-way leaves behind, which is a seam nobody would remember when reading
             // either.
@@ -3066,7 +3063,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             //
             // The executor re-stamp is guarded on ownership, which is a deliberate divergence.
             // On conflict the upsert would otherwise hand `executor_id` to whoever submitted
-            // last — including a duplicate `Fresh` submission of a workflow another executor is
+            // last — including a duplicate submission of a workflow another executor is
             // running. That misdirects recovery: the sweep keys on `executor_id`, so the real
             // owner's sweep stops finding the workflow and the submitter's starts,
             // and the second execution is only caught later, at its first step.
@@ -3100,18 +3097,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                  COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {NOW_MS_SQL} + $18 END), \
                  $20, $21, $22, $23::jsonb, $24, $25, $26, $27) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
-                   recovery_attempts = CASE \
-                       WHEN {workflow_table}.status != 'ENQUEUED' AND {workflow_table}.status != 'DELAYED' \
-                       THEN {workflow_table}.recovery_attempts + $28 \
-                       ELSE {workflow_table}.recovery_attempts \
-                   END, \
                    updated_at = {NOW_MS_SQL}, \
                    executor_id = CASE \
                        WHEN EXCLUDED.status = 'ENQUEUED' OR EXCLUDED.status = 'DELAYED' \
                        THEN {workflow_table}.executor_id \
                        WHEN {workflow_table}.owner_xid IS NULL \
                          OR {workflow_table}.owner_xid = EXCLUDED.owner_xid \
-                         OR $29 \
                        THEN EXCLUDED.executor_id \
                        ELSE {workflow_table}.executor_id \
                    END \
@@ -3163,8 +3154,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .application_name
                     .or(self.application_name.as_deref()),
             )
-            .bind(increment)
-            .bind(claiming)
             .fetch_one(&mut *tx)
             .await
             // A unique violation here can only be the partial index on
@@ -3288,9 +3277,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 });
             }
 
-            // Another owner holds the row and this is not a recovery, so recording it is right
-            // but running it would be a second execution.
-            let should_execute = !(owner_differs && !claiming && stored_owner.is_some());
+            // Another owner holds the row, so recording it is right but running it would be a
+            // second execution.
+            let should_execute = !(owner_differs && stored_owner.is_some());
             if !should_execute {
                 tracing::debug!(
                     workflow_id = workflow.workflow_id,
@@ -3300,9 +3289,8 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // **The row's own input, where a fresh start is to run a row it did not create** —
             // one no attempt owns. Read in the transaction that claimed the row, so the run starts
-            // from what the row holds. A recovery or a dequeue is not asked: its caller read the
-            // input with the row it claimed.
-            let existing_input = if owner_differs && !claiming && stored_owner.is_none() {
+            // from what the row holds.
+            let existing_input = if owner_differs && stored_owner.is_none() {
                 Some(
                     sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(format!(
                         "SELECT {stored_input} FROM {workflow_table} WHERE workflow_uuid = $1"
@@ -3342,6 +3330,19 @@ impl SystemDatabase for PostgresSystemDatabase {
                 existing_input,
                 should_execute,
             })
+        })
+        .await
+    }
+
+    async fn database_time(&self) -> Result<DatabaseTime, Error> {
+        let pool = &self.pool;
+        with_retry(&self.retry, "database_time", move || async move {
+            // The statement's clock, as `init_workflow` returns.
+            let epoch_ms: i64 =
+                sqlx::query_scalar("SELECT (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint")
+                    .fetch_one(pool)
+                    .await?;
+            Ok(DatabaseTime::read(epoch_ms))
         })
         .await
     }
@@ -4044,6 +4045,35 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(executor_ids)
             .bind(application_version)
             .bind(application_name)
+            .fetch_all(pool)
+            .await?;
+            Ok(ids)
+        })
+        .await
+    }
+
+    async fn dead_letter_workflows(
+        &self,
+        workflow_ids: &[&str],
+        min_recovery_attempts: i64,
+    ) -> Result<Vec<String>, Error> {
+        if workflow_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        with_retry(&self.retry, "dead_letter_workflows", move || async move {
+            let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "UPDATE {workflow_table} \
+                 SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', deduplication_id = NULL, \
+                     started_at_epoch_ms = NULL, queue_name = NULL, \
+                     updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
+                 WHERE workflow_uuid = ANY($1) AND status = 'PENDING' \
+                   AND recovery_attempts >= $2 \
+                 RETURNING workflow_uuid"
+            )))
+            .bind(workflow_ids)
+            .bind(min_recovery_attempts)
             .fetch_all(pool)
             .await?;
             Ok(ids)
@@ -6357,13 +6387,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // **`recovery_attempts` is counted here, and only here.** This is the transition that
             // starts a workflow, and since recovery re-enqueues rather than re-invoking, it is the
             // transition every recovered workflow makes too — so a budget counted anywhere else is
-            // a budget never spent. `init_workflow`'s `ON CONFLICT` deliberately does not count it:
-            // that arm is Java's, and Java can own the count because Java re-invokes a `PENDING`
-            // row instead of re-enqueueing it, so its upsert sees the claim this statement sees.
-            // The three implementations that re-enqueue all count in their claim exactly here — go
-            // `system_database.go`, ts `system_database.ts` (in both of its claim paths), python
-            // `_sys_db.py`, whose comment says it outright: *"Count this dispatch against the DLQ
-            // limit; no later insert does it."*
+            // a budget never spent. The dispatch that follows reads the count this writes, and
+            // parks the row once it is past the limit.
             //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
             // already moved the row, so a loser matches nothing, charges the workflow nothing, and
@@ -7829,7 +7854,7 @@ mod tests {
         timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
-        EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Submission, Timestamp,
+        EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Timestamp,
     };
     use crate::sysdb::{BackendError, BackendErrorKind, Error, SystemDatabase};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -8059,7 +8084,6 @@ mod tests {
                 ..NewWorkflow::new("wf-caller")
             },
             None,
-            Submission::Fresh,
             None,
         )
         .await
@@ -8457,7 +8481,7 @@ mod tests {
         .await
         .expect("connect failed");
 
-        sys.init_workflow(&NewWorkflow::new("wf-idle"), None, Submission::Fresh, None)
+        sys.init_workflow(&NewWorkflow::new("wf-idle"), None, None)
             .await
             .unwrap();
         let table = sys.tables.workflow_status.as_str();

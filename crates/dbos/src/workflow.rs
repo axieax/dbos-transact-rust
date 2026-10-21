@@ -22,8 +22,7 @@ use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
-    StepCaller, StepTiming, Submission, Timestamp, WorkflowInitResult, decode_step_value,
-    encode_step_value,
+    StepCaller, StepTiming, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -667,7 +666,7 @@ pub(crate) async fn init_or_join(
     loop {
         match conn
             .sysdb()
-            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh, caller)
+            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), caller)
             .await
         {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
@@ -1948,8 +1947,8 @@ pub(crate) struct Deadline {
 }
 
 impl Deadline {
-    /// The deadline `init_workflow` reported, timed from the reading of the database's clock that
-    /// came back with it.
+    /// A deadline the database set, timed from a reading of the database's clock: the one
+    /// `init_workflow` returned with it, or a dequeue's reading for its batch.
     pub(crate) fn of(at: Option<Timestamp>, clock: DatabaseTime) -> Option<Self> {
         at.map(|at| Self {
             at,
