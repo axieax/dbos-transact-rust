@@ -2221,9 +2221,9 @@ async fn a_workflow_cannot_delete_an_ancestors_tree() {
     dbos.shutdown().await;
 }
 
-/// **A workflow can't cancel or resume itself, and is told so before anything runs.** A resume
-/// would re-enqueue it underneath its own execution, and start a second one beside it. Refused,
-/// the workflow can catch the error and go on, and finishes.
+/// **A workflow can't cancel or resume itself, and is told so before anything runs.** Both
+/// would clear its own owner token, so its next write would be refused and it would wait for an
+/// outcome nobody computes. Refused, the workflow can catch the error and go on, and finishes.
 #[tokio::test]
 async fn a_workflow_cannot_cancel_or_resume_itself() {
     let db = test_database().await;
@@ -2273,8 +2273,9 @@ async fn a_workflow_cannot_cancel_or_resume_itself() {
     dbos.shutdown().await;
 }
 
-/// **Nor from inside one of its steps**, where the call records nothing of its own and so passes
-/// the system database no caller to compare.
+/// **Nor from inside one of its steps**, where the call records nothing of its own: the step's
+/// record would be refused, and a resume would have every new execution run the step again and
+/// resume itself again, forever.
 #[tokio::test]
 async fn a_step_cannot_cancel_or_resume_its_own_workflow() {
     let db = test_database().await;

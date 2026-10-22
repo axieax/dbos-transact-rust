@@ -90,8 +90,9 @@ use super::types::{
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
     ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
     StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
-    duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
+    WorkflowFilter, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value,
+    duration_from_ms, duration_from_secs, encode_step_value, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -327,6 +328,10 @@ pub struct Config<'a> {
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
     /// session, set on every connection [`PostgresSystemDatabase::connect`] opens.
+    ///
+    /// The owner check locks a workflow's row until the write it guards commits, so a process that
+    /// stalls mid-transaction (a frozen container, a network partition) would otherwise hold that
+    /// row, and with it every hand-off of the workflow, for as long as the stall lasts.
     pub idle_transaction_timeout: IdleTransactionTimeout,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
@@ -901,8 +906,8 @@ impl PostgresSystemDatabase {
     /// a lost acknowledgement, and stamping it per attempt would break that — everywhere but
     /// here. The check and the insert share one transaction, so an attempt that committed and
     /// lost its acknowledgement is caught by `check_step_on` on the next attempt and replayed,
-    /// never reaching the insert. What survives to compare timestamps is a genuine rival, and
-    /// there a differing completion is the right answer.
+    /// never reaching the insert. Nothing that survives to compare timestamps is a lost
+    /// acknowledgement, so there a differing completion is the right answer.
     async fn run_transactional_step<T, F, Fut>(
         &self,
         caller: Option<StepCaller<'_>>,
@@ -917,13 +922,17 @@ impl PostgresSystemDatabase {
     {
         let mut tx = self.pool.begin().await?;
 
-        if let Some(caller) = caller
-            && let Some(step) = self
+        // Check, then work: the owner check comes first, so a refusal rolls the work back with
+        // it, and the work and its record commit together under the lock the check took.
+        if let Some(caller) = caller {
+            self.check_owner_on(&mut tx, caller.owner()).await?;
+            if let Some(step) = self
                 .check_step_on(&mut tx, caller.workflow_id, caller.step_id, step_name)
                 .await?
-        {
-            tx.commit().await?;
-            return replayed_output(&step, caller, step_name);
+            {
+                tx.commit().await?;
+                return replayed_output(&step, caller, step_name);
+            }
         }
 
         // A failure drops the transaction inside `work`, which rolls it back.
@@ -1007,7 +1016,7 @@ impl PostgresSystemDatabase {
         if let Some(stored) = stored
             && stored.as_deref() != Some(child_workflow_id)
         {
-            return Err(Error::StepAlreadyRecorded {
+            return Err(Error::StepNondeterminism {
                 workflow_id: parent_workflow_id.to_owned(),
                 step_id,
             });
@@ -1070,8 +1079,8 @@ impl PostgresSystemDatabase {
     /// - **Recorded** — the failure itself is returned, and a replay raises it again.
     /// - **The record fails** — that failure is returned instead, and the step stays unrecorded.
     ///   If it is retryable, `with_retry` runs the step again from the check.
-    /// - **A rival recorded the step first** — [`Error::StepAlreadyRecorded`], exactly as when a
-    ///   rival wins against a success: this execution is superseded.
+    /// - **The step is recorded already** — [`Error::StepNondeterminism`], exactly as when a
+    ///   success finds it so.
     ///
     /// The gap between the rollback and the record is safe because the workflow sees the failure
     /// only once it is recorded. A crash in between leaves nothing recorded and nothing observed,
@@ -1096,6 +1105,7 @@ impl PostgresSystemDatabase {
             workflow_id,
             step_id,
             codec,
+            ..
         } = caller;
         // A custom serializer may fail to encode the error. Then the error stays unrecorded and
         // the encoding failure is what the caller sees — not a recordable answer, so the step runs
@@ -1117,6 +1127,7 @@ impl PostgresSystemDatabase {
         };
         let record = async {
             let mut tx = self.pool.begin().await?;
+            self.check_owner_on(&mut tx, caller.owner()).await?;
             self.record_step_on(
                 &mut tx,
                 workflow_id,
@@ -1184,6 +1195,7 @@ impl PostgresSystemDatabase {
         };
 
         let mut conn = StepConn::Transactional(Box::new(self.pool.begin().await?));
+        self.check_owner_on(&mut conn, caller.owner()).await?;
         if let Some(step) = self
             .check_step_on(&mut conn, caller.workflow_id, caller.step_id, step_name)
             .await?
@@ -2085,8 +2097,8 @@ const VERSION_COLUMNS: &str =
 
 /// The application a row keyed by name should end up owned by, having read which holds it now.
 ///
-/// Not to be confused with `owner_xid`, the other ownership in this schema: that names an
-/// execution attempt, this names an application.
+/// Not to be confused with `owner_xid`, the other ownership in this schema: that names the
+/// execution running a workflow, this names an application.
 ///
 /// A nameless writer leaves an existing owner intact; one whose name already matches proceeds;
 /// one with a *different* name is refused, because taking the row would redirect the holder's
@@ -2349,6 +2361,35 @@ impl PostgresSystemDatabase {
         }
     }
 
+    /// Refuses the write this transaction is about to make unless `owner` still owns its
+    /// workflow, and locks the workflow's row until the transaction ends, so a hand-off (a cancel,
+    /// a resume, a recovery, a claim) can't land between this check and the write. A row with no
+    /// owner, another owner, or no row at all is a [`WorkflowConflict`](Error::WorkflowConflict).
+    ///
+    /// First in its transaction, before the work it guards: a refused check rolls the work back
+    /// with it. `FOR NO KEY UPDATE` rather than `FOR UPDATE`, so inserts that reference the row
+    /// (its steps, events and streams) don't wait on it; CockroachDB takes it as `FOR UPDATE`.
+    async fn check_owner_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        owner: WorkflowOwner<'_>,
+    ) -> Result<(), Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let current: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT owner_xid FROM {workflow_table} WHERE workflow_uuid = $1 FOR NO KEY UPDATE"
+        )))
+        .bind(owner.workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if current.flatten().as_deref() == Some(owner.owner_xid) {
+            Ok(())
+        } else {
+            Err(Error::WorkflowConflict {
+                workflow_id: owner.workflow_id.to_owned(),
+            })
+        }
+    }
+
     /// The one statement behind every recorded step, against a caller's connection.
     ///
     /// Two trait methods reach it and its parameter list is their union, which is why it runs two
@@ -2398,21 +2439,13 @@ impl PostgresSystemDatabase {
             // reverse order — claim, then record — leaves a workflow attributed to an executor
             // with no step to show for it, and nothing later fixes that.
             //
-            // And it is why this is not a transaction, which the ordering makes unnecessary. The
-            // references split on exactly this line: Python claims before inserting and so wraps
-            // both in `engine.begin()`; Java and TypeScript claim after winning and use a plain
-            // connection, as here. A transaction would only hold a `workflow_status` row lock
-            // across two round trips.
-            //
-            // The gap it would close is already covered. A *retryable* failure on the second
-            // statement re-runs this closure, the insert returns our own completion time, and
-            // the claim runs again. A *permanent* one returns an error with the step recorded —
-            // and a caller retrying with the same `StepTiming` is recognised as its own write.
+            // Every caller runs this inside a transaction that opened with the owner check, so the
+            // two statements commit together, and a failure on the second rolls the first back.
             //
             // `DO UPDATE` setting a column to itself rather than `DO NOTHING`: the point is to
             // make `RETURNING` fire on conflict, so the stored completion comes back and can be
-            // compared. `DO NOTHING` returns no row, which cannot tell a rival execution from
-            // this caller's own retry. Python and TypeScript use the same trick; Java uses
+            // compared. `DO NOTHING` returns no row, which cannot tell a step recorded already
+            // from this caller's own retry. Python and TypeScript use the same trick; Java uses
             // `DO NOTHING` and so silently accepts a duplicate.
             //
             // `Option<Option<i64>>`: the outer is "was there a row", the inner is the column,
@@ -2453,7 +2486,7 @@ impl PostgresSystemDatabase {
                     step_name,
                     "step was already recorded by another execution"
                 );
-                return Err(Error::StepAlreadyRecorded {
+                return Err(Error::StepNondeterminism {
                     workflow_id: workflow_id.to_owned(),
                     step_id,
                 });
@@ -2510,9 +2543,11 @@ impl PostgresSystemDatabase {
         // was cancelled *did* start, so clearing the column discards true information and hides the
         // row from `started_after`/`started_before`. Kept anyway — diverging from four
         // implementations on a durable column is the worse trade.
+        // `owner_xid` is cleared so the execution running a cancelled workflow, should it still
+        // be writing, is refused at its next write.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
-             deduplication_id = NULL, started_at_epoch_ms = NULL, \
+             deduplication_id = NULL, started_at_epoch_ms = NULL, owner_xid = NULL, \
              updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
              WHERE workflow_uuid = ANY($1) \
                AND status NOT IN ('SUCCESS', 'ERROR', 'CANCELLED') \
@@ -2640,6 +2675,7 @@ impl PostgresSystemDatabase {
         step_id: i32,
         duration: Duration,
         kind: SleepKind,
+        owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         let pool = &self.pool;
         // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
@@ -2649,11 +2685,17 @@ impl PostgresSystemDatabase {
             Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
 
         with_retry(&self.retry, "checkpoint_sleep", move || async move {
-            // No transaction, unlike `set_event`: there is no separate write to orphan here —
-            // the step record *is* the write, and the wake time is its output. The check-then-
-            // record race is caught by the insert's `ON CONFLICT` below, and the insert and the
-            // executor claim inside `record_step_on` are safe by their ordering.
-            let mut conn = pool.acquire().await?;
+            // A transaction for the owner check, which locks the workflow's row until the record
+            // commits; the record itself is the only write, and the wake time its output.
+            let mut conn = pool.begin().await?;
+            self.check_owner_on(
+                &mut conn,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
 
             // A replay wakes at the *original* instant. Starting the clock again would make a
             // workflow that crashed fifty minutes into an hour sleep another full hour.
@@ -2697,11 +2739,13 @@ impl PostgresSystemDatabase {
                 )
                 .await
             {
-                Ok(()) => Ok(wake_at),
-                // A rival recorded the sleep between our check and our write. Its wake time is
-                // the one every execution must agree on, so adopt it rather than returning ours.
-                // Python swallows this and returns its own, which two runs would disagree about.
-                Err(Error::StepAlreadyRecorded { .. }) => {
+                Ok(()) => {
+                    conn.commit().await?;
+                    Ok(wake_at)
+                }
+                // The sleep was recorded between our check and our write. Its wake time is the
+                // one every replay must agree on, so adopt it rather than returning ours.
+                Err(Error::StepNondeterminism { .. }) => {
                     let step = self
                         .check_step_on(&mut conn, workflow_id, step_id, step_names::SLEEP)
                         .await?
@@ -2987,16 +3031,13 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
-        max_recovery_attempts: Option<i64>,
         caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
         let workflow_table = &self.tables.workflow_status;
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
         let initial_status = workflow.initial_status();
-        // Queued workflows are not running, so neither the attempt counter nor the executor
-        // stamp applies to them: a queued row starts at zero attempts, and the `executor_id`
-        // `CASE` below keeps the stored stamp for one.
+        // A queued workflow is not running, so it starts with no attempt counted against it.
         let queued = matches!(
             initial_status,
             WorkflowStatus::Enqueued | WorkflowStatus::Delayed
@@ -3005,12 +3046,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Everything below is generated **outside** the retry, and that is the whole reason the
         // retry is a wrapper rather than a loop around the statement.
         //
-        // The owner identity is per logical attempt, not per statement. If a commit
-        // acknowledgement is lost, the retry must present the same identity or it will fail to
-        // recognise its own write and conclude someone else owns the row — which would report
-        // `should_execute: false` for a workflow this caller does in fact own. Java's comment
-        // says the same: "generated outside of the DB retry loop, in case commit acks get lost".
-        let owner_xid = uuid::Uuid::new_v4().to_string();
+        // The creator token is per logical attempt, not per statement. If a commit
+        // acknowledgement is lost, the retry must present the same token or it will fail to
+        // recognise its own insert and conclude someone else created the row, which would report
+        // `should_execute: false` for a workflow this caller does in fact own.
+        let creator_xid = uuid::Uuid::new_v4().to_string();
         // `created_at` and `updated_at` come from the database clock, inside the statement, as
         // the input row's `retention_timestamp` does through its column default. A retention sweep
         // run by any executor sharing this database relies on that: a payload stamped before its
@@ -3034,14 +3074,12 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
-        let (workflow_table, input_table, pool, owner_xid) = (
+        let (workflow_table, input_table, pool, creator_xid) = (
             workflow_table.as_str(),
             self.tables.workflow_input.as_str(),
             &self.pool,
-            owner_xid.as_str(),
+            creator_xid.as_str(),
         );
-        let stored_input = payload_column(&self.tables, PayloadColumn::Inputs);
-        let stored_input = stored_input.as_str();
 
         with_retry(&self.retry, "init_workflow", move || async move {
             // **A transaction, because the caller's record has to land with the row.**
@@ -3053,6 +3091,18 @@ impl SystemDatabase for PostgresSystemDatabase {
             // a failure part-way leaves behind, which is a seam nobody would remember when reading
             // either.
             let mut tx = pool.begin().await?;
+            // A start from inside a workflow is a write of that workflow's, so its execution must
+            // still own it; checked first, so a stale parent creates no child.
+            if let Some(caller) = caller {
+                self.check_owner_on(
+                    &mut tx,
+                    WorkflowOwner {
+                        workflow_id: caller.parent_workflow_id,
+                        owner_xid: caller.owner_xid,
+                    },
+                )
+                .await?;
+            }
 
             // The column list is Java's INSERT, in its order, plus Python's two debounce
             // columns. Columns absent from it are absent deliberately: `started_at`,
@@ -3061,27 +3111,15 @@ impl SystemDatabase for PostgresSystemDatabase {
             // columns, `inputs`, `output` and `error`, are never written at all: the input goes to
             // `workflow_input` below, and the outcome to `workflow_output`.
             //
-            // The executor re-stamp is guarded on ownership, which is a deliberate divergence.
-            // On conflict the upsert would otherwise hand `executor_id` to whoever submitted
-            // last — including a duplicate submission of a workflow another executor is
-            // running. That misdirects recovery: the sweep keys on `executor_id`, so the real
-            // owner's sweep stops finding the workflow and the submitter's starts,
-            // and the second execution is only caught later, at its first step.
+            // **Two tokens, two roles.** `creator_xid` names the attempt that inserted the row and
+            // never changes; it is how a start that finds the row already there tells its own
+            // retried insert from another caller's. `owner_xid` names the execution that owns the
+            // workflow now: this attempt, for a row it inserts `PENDING` and so runs at once, and
+            // nobody for a queued or delayed one, until a dequeue's claim writes its own token.
             //
-            // Java and TypeScript prevent it by letting the write land and rolling the
-            // transaction back for a non-owner; Python and Go let it stand. The `CASE` reaches
-            // Java's and TypeScript's outcome without their transaction — the row simply keeps
-            // its executor.
-            //
-            // Its middle arm is the lost-acknowledgement case: `owner_xid` is generated once per
-            // logical attempt, so it matches an existing row only when this *is* that attempt
-            // asking again. Ownership is compared on `owner_xid` and not `executor_id` for the
-            // reason migration 7 exists — `executor_id` defaults to `"local"` and collides
-            // between processes on one machine.
-            //
-            // TODO(dbos-team): UPSTREAM item 10, to settle before v1. No implementation does
-            // exactly this, so it wants proposing upstream rather than carrying as a Rust-only
-            // difference.
+            // **The conflict arm changes nothing.** It exists so `RETURNING` reports the row
+            // that was already there; whoever holds it keeps it, its attempt count and its
+            // executor.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {workflow_table} (workflow_uuid, status, \
                  name, class_name, config_name, \
@@ -3091,23 +3129,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                  created_at, updated_at, recovery_attempts, \
                  workflow_timeout_ms, workflow_deadline_epoch_ms, \
                  parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
-                 debounce_deadline_epoch_ms, is_debounced, application_name) \
+                 debounce_deadline_epoch_ms, is_debounced, application_name, creator_xid) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
                  {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, \
                  COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {NOW_MS_SQL} + $18 END), \
-                 $20, $21, $22, $23::jsonb, $24, $25, $26, $27) \
+                 $20, CASE WHEN $2 = 'PENDING' THEN $21 END, $22, $23::jsonb, $24, $25, $26, \
+                 $27, $21) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
-                   updated_at = {NOW_MS_SQL}, \
-                   executor_id = CASE \
-                       WHEN EXCLUDED.status = 'ENQUEUED' OR EXCLUDED.status = 'DELAYED' \
-                       THEN {workflow_table}.executor_id \
-                       WHEN {workflow_table}.owner_xid IS NULL \
-                         OR {workflow_table}.owner_xid = EXCLUDED.owner_xid \
-                       THEN EXCLUDED.executor_id \
-                       ELSE {workflow_table}.executor_id \
-                   END \
+                   creator_xid = {workflow_table}.creator_xid \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
-                 workflow_deadline_epoch_ms, owner_xid, serialization, \
+                 workflow_deadline_epoch_ms, creator_xid, serialization, \
                  (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint AS db_now"
             )))
             .bind(workflow.workflow_id)
@@ -3135,7 +3166,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // The child's own back-pointer, from the caller that is also recording the start:
             // one value, both rows, no way for them to name different parents.
             .bind(caller.map(|caller| caller.parent_workflow_id))
-            .bind(owner_xid)
+            .bind(creator_xid)
             .bind(workflow.serialization)
             .bind(workflow.attributes)
             .bind(workflow.schedule_name)
@@ -3182,7 +3213,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             let clock = DatabaseTime::read(row.try_get("db_now")?);
             let recovery_attempts: i64 = row.try_get("recovery_attempts")?;
             let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
-            let stored_owner: Option<String> = row.try_get("owner_xid")?;
+            let stored_creator: Option<String> = row.try_get("creator_xid")?;
             let deadline: Option<i64> = row.try_get("workflow_deadline_epoch_ms")?;
             let serialization: Option<String> = row.try_get("serialization")?;
 
@@ -3218,23 +3249,27 @@ impl SystemDatabase for PostgresSystemDatabase {
                 );
             }
 
-            // Whether another attempt owns the row. The stored `owner_xid` is this attempt's
-            // exactly when this attempt created the row: the conflict arm above never rewrites it,
-            // and the identity is fresh per logical attempt — so a match is either the insert that
-            // just happened or a retry of it after a lost acknowledgement.
-            let owner_differs = stored_owner.as_deref() != Some(owner_xid);
+            // Whether this attempt created the row: its own insert, or a retry of it after a lost
+            // acknowledgement. Anything else is another caller's workflow, which this one joins
+            // rather than runs, whatever has become of the row since: a row a timeout or a cancel
+            // left without an owner is still not this caller's to run again.
+            let should_execute = stored_creator.as_deref() == Some(creator_xid);
+            if !should_execute {
+                tracing::debug!(
+                    workflow_id = workflow.workflow_id,
+                    "another caller created this workflow; recorded but not run"
+                );
+            }
 
             // The input, in its own table, **only when this attempt created the row** (a retry
             // after a lost acknowledgement writes the same input again). A submission that found
             // an existing row must not touch its input: that is the input the workflow was
             // recorded with, and a replay has to see it.
             //
-            // Java gates on creation the same way; Python, TypeScript and Go write unconditionally
-            // with `ON CONFLICT DO NOTHING`, which is equivalent for a row that has its input. The
-            // upsert is for one that does not: a `workflow_input` row whose status row is gone —
-            // deleted by a writer that relied on the cascade migration 112 removed, or outlived
-            // by the retention sweep — would otherwise hand this fresh workflow a stale input.
-            if !owner_differs {
+            // An upsert for a `workflow_input` row whose status row is gone, deleted by a writer
+            // that relied on the cascade migration 112 removed, or outlived by the retention
+            // sweep, which would otherwise hand this fresh workflow a stale input.
+            if should_execute {
                 sqlx::query(AssertSqlSafe(format!(
                     "INSERT INTO {input_table} (workflow_uuid, inputs) VALUES ($1, $2) \
                      ON CONFLICT (workflow_uuid) DO UPDATE SET inputs = EXCLUDED.inputs"
@@ -3244,64 +3279,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .execute(&mut *tx)
                 .await?;
             }
-
-            // Parked once it has been recovered more often than allowed — but only if some *other*
-            // attempt is responsible, so a caller retrying its own attempt is not punished for it.
-            if let Some(limit) = max_recovery_attempts
-                && !status.is_terminal()
-                && recovery_attempts > limit + 1
-                && owner_differs
-            {
-                sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} \
-                     SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', deduplication_id = NULL, \
-                         started_at_epoch_ms = NULL, queue_name = NULL, \
-                         updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
-                     WHERE workflow_uuid = $1 AND status = 'PENDING'"
-                )))
-                .bind(workflow.workflow_id)
-                .execute(&mut *tx)
-                .await?;
-
-                // **Committed before the error, unlike every other failure here.** Parking is the
-                // one error path that is itself a write: the workflow has to come out of this call
-                // `MAX_RECOVERY_ATTEMPTS_EXCEEDED` and stay there, or the next recovery attempt
-                // finds it `PENDING` and parks it again forever. Every other early return is a
-                // refusal that wrote nothing worth keeping, and rolls back — so a rejected
-                // submission does not bump the row's recovery count on its way out.
-                tx.commit().await?;
-
-                return Err(Error::MaxRecoveryAttemptsExceeded {
-                    workflow_id: workflow.workflow_id.to_owned(),
-                    limit,
-                });
-            }
-
-            // Another owner holds the row, so recording it is right but running it would be a
-            // second execution.
-            let should_execute = !(owner_differs && stored_owner.is_some());
-            if !should_execute {
-                tracing::debug!(
-                    workflow_id = workflow.workflow_id,
-                    "another owner holds this workflow; recorded but not claimed"
-                );
-            }
-
-            // **The row's own input, where a fresh start is to run a row it did not create** —
-            // one no attempt owns. Read in the transaction that claimed the row, so the run starts
-            // from what the row holds.
-            let existing_input = if owner_differs && stored_owner.is_none() {
-                Some(
-                    sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(format!(
-                        "SELECT {stored_input} FROM {workflow_table} WHERE workflow_uuid = $1"
-                    )))
-                    .bind(workflow.workflow_id)
-                    .fetch_one(&mut *tx)
-                    .await?,
-                )
-            } else {
-                None
-            };
 
             // **The parent's record of the start, in the transaction that created the child.**
             // Written for a row this call merely found as well as one it created: the parent
@@ -3327,8 +3304,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 deadline: deadline.map(Timestamp::from_epoch_ms),
                 clock,
                 serialization,
-                existing_input,
                 should_execute,
+                creator_xid: creator_xid.to_owned(),
             })
         })
         .await
@@ -3337,7 +3314,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn database_time(&self) -> Result<DatabaseTime, Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "database_time", move || async move {
-            // The statement's clock, as `init_workflow` returns.
+            // The statement's clock, as `init_workflow` returns, read once the claim has committed.
             let epoch_ms: i64 =
                 sqlx::query_scalar("SELECT (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint")
                     .fetch_one(pool)
@@ -3627,6 +3604,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         outcome: Outcome<'_>,
+        owner_xid: &str,
     ) -> Result<OutcomeWrite, Error> {
         let (workflow_table, output_table, pool) = (
             self.tables.workflow_status.as_str(),
@@ -3638,9 +3616,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "record_workflow_outcome", move || async move {
             let mut tx = pool.begin().await?;
 
-            // The `status = 'PENDING'` predicate is the whole mechanism: an executor that has
-            // been presumed dead and superseded finds zero rows updated, and learns it lost
-            // rather than clobbering the winner's result. It also makes this retry-safe — a
+            // The `status = 'PENDING'` and owner predicates are the whole mechanism: an execution
+            // that has been superseded (presumed dead and recovered, resumed, or cancelled and
+            // resumed) finds zero rows updated, and learns it lost rather than clobbering the
+            // winner's result. The owner is cleared with the write, since no execution holds a
+            // finished workflow. It also makes this retry-safe — a
             // retry after a lost acknowledgement finds its own write and reports
             // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
             // Finishing releases the deduplication key, as it does in all four implementations.
@@ -3654,11 +3634,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             let updated = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} SET status = $2, output = NULL, error = NULL, \
                  updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}, \
-                 deduplication_id = NULL \
-                 WHERE workflow_uuid = $1 AND status = 'PENDING'"
+                 deduplication_id = NULL, owner_xid = NULL \
+                 WHERE workflow_uuid = $1 AND status = 'PENDING' \
+                   AND owner_xid = $3"
             )))
             .bind(workflow_id)
             .bind(outcome.status().as_str())
+            .bind(owner_xid)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -3949,27 +3931,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error> {
-        let workflow_table = &self.tables.workflow_status;
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
-
-        with_retry(&self.retry, "clear_queue_assignment", move || async move {
-            // `queue_name IS NOT NULL` is what makes this a *return* rather than an enqueue: a
-            // workflow that never came from a queue has none to go back to.
-            let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
-                 updated_at = {NOW_MS_SQL} \
-                 WHERE workflow_uuid = $1 AND queue_name IS NOT NULL AND status = 'PENDING'"
-            )))
-            .bind(workflow_id)
-            .execute(pool)
-            .await?
-            .rows_affected();
-            Ok(updated > 0)
-        })
-        .await
-    }
-
     async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
@@ -4022,7 +3983,9 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(&self.retry, "reenqueue_for_recovery", move || async move {
             // `started_at_epoch_ms` is cleared because the row has not started yet — leaving the
-            // dead run's start time would make the queue wait look like execution.
+            // dead run's start time would make the queue wait look like execution. `owner_xid` is
+            // cleared because the dead run no longer owns it: should it still be writing, its next
+            // write is refused, and the claim that dequeues the row writes its own token.
             //
             // `NULLIF` is Go's, and it is for rows this implementation did not write: older
             // versions stored "not queued" as the empty string rather than NULL, and without it
@@ -4031,6 +3994,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 "UPDATE {workflow_table} \
                  SET status = 'ENQUEUED', \
                      started_at_epoch_ms = NULL, \
+                     owner_xid = NULL, \
                      updated_at = {NOW_MS_SQL}, \
                      queue_name = COALESCE(NULLIF(queue_name, ''), $1) \
                  WHERE status = 'PENDING' \
@@ -4065,8 +4029,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "dead_letter_workflows", move || async move {
             let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} \
-                 SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', deduplication_id = NULL, \
-                     started_at_epoch_ms = NULL, queue_name = NULL, \
+                 SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', owner_xid = NULL, \
+                     deduplication_id = NULL, started_at_epoch_ms = NULL, queue_name = NULL, \
                      updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = ANY($1) AND status = 'PENDING' \
                    AND recovery_attempts >= $2 \
@@ -4081,16 +4045,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error> {
+    async fn cancel_if_timed_out(&self, workflow_id: &str, owner_xid: &str) -> Result<bool, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         with_retry(&self.retry, "cancel_if_timed_out", move || async move {
             let moved = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET {set} WHERE workflow_uuid = $1 AND {timed_out}",
+                "UPDATE {workflow_table} SET {set} \
+                 WHERE workflow_uuid = $1 AND owner_xid = $2 AND {timed_out}",
                 set = timed_out_set_sql(),
                 timed_out = timed_out_where_sql(),
             )))
             .bind(workflow_id)
+            .bind(owner_xid)
             .execute(pool)
             .await?
             .rows_affected();
@@ -4316,10 +4282,12 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                     // `completed_at` and `started_at_epoch_ms` are cleared as well as the
                     // counters: the workflow is going to run again, and leaving them set would
-                    // date it to its last attempt.
+                    // date it to its last attempt. `owner_xid` is cleared because the claim that
+                    // dequeues it is the next owner: an execution still running a resumed `PENDING`
+                    // workflow is refused at its next write rather than running beside it.
                     let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                         "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
-                         recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
+                         recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, owner_xid = NULL, \
                          deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
                          updated_at = {NOW_MS_SQL} \
                          WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
@@ -4739,6 +4707,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         serialization: Option<&str>,
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error> {
         // One message is a batch of one everywhere below this line; only the recorded name differs.
         self.deliver(
@@ -4747,6 +4716,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             caller,
             step_names::SEND,
             send_to_forks,
+            owner,
         )
         .await
     }
@@ -4757,6 +4727,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         serialization: Option<&str>,
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error> {
         self.deliver(
             messages,
@@ -4764,6 +4735,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             caller,
             step_names::SEND_BULK,
             send_to_forks,
+            owner,
         )
         .await
     }
@@ -4775,6 +4747,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         timeout_step_id: i32,
         topic: Option<&str>,
         timeout: Duration,
+        owner_xid: &str,
     ) -> Result<Option<EncodedValue>, Error> {
         let notifications_table = self.tables.notifications.as_str();
         let (pool, polling) = (&self.pool, &self.polling);
@@ -4859,16 +4832,22 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
 
         // Before the first look: registering after looking would miss a message that landed in
-        // between. Shared, not exclusive: a workflow resumed while its execution waits here has a
-        // second execution waiting beside it, and refusing that one would end it with an error
-        // although the message may well be its. Both wake, and the consuming statement gives the
-        // message to one of them.
+        // between. Shared, not exclusive: two receives of one execution can wait here at once, and
+        // so can an execution whose workflow was handed to a new one, beside the new owner. Both
+        // wake, the consuming statement gives the message to one of them, and a stale execution's
+        // consume is refused by the owner check.
         let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
         // sixty seconds and crashed has ten left rather than sixty.
         let deadline = self
-            .checkpoint_sleep(workflow_id, timeout_step_id, timeout, SleepKind::Deadline)
+            .checkpoint_sleep(
+                workflow_id,
+                timeout_step_id,
+                timeout,
+                SleepKind::Deadline,
+                owner_xid,
+            )
             .await?;
 
         // Look, wait a bounded interval, look again — `get_event`'s loop exactly, and for the same
@@ -4913,8 +4892,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         // there is nothing left to be woken for.
         drop(subscription);
 
-        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
-        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        // Fixed here rather than inside the retry: `completed_at` is also what recognises this
+        // caller's own re-attempt after a lost acknowledgement, so it must not move between
+        // attempts.
         let timing = StepTiming {
             started_at,
             completed_at: Timestamp::now(),
@@ -4932,6 +4912,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         // and records the same `None` it would have recorded either way.
         with_retry(&self.retry, "recv", move || async move {
             let mut tx = pool.begin().await?;
+            // First, so a refusal rolls the consume back with it: the message stays for the
+            // workflow's new owner.
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
 
             // The check that opened this call cannot stand in for this one: the wait between them
             // is exactly when another execution of this workflow would have recorded its own
@@ -4942,11 +4932,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?
             {
                 tx.commit().await?;
-                tracing::debug!(
-                    workflow_id,
-                    step_id = step_id,
-                    "adopting a rival execution's recv"
-                );
+                tracing::debug!(workflow_id, step_id = step_id, "replaying recv");
                 return Ok(step.output.map(|value| EncodedValue {
                     value,
                     serialization: step.serialization,
@@ -4970,15 +4956,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // The sender's own payload under the sender's own format, as `get_event` records the
             // publisher's. A timeout records a NULL output.
             //
-            // **A conflict here is reported, and the rollback is what makes that safe.** It means
-            // another execution recorded this step between the check above and this write — at READ
-            // COMMITTED the check ran on an earlier snapshot than the `UPDATE`, so this attempt may
-            // have taken a message. Dropping the transaction un-takes it, so the message stays
-            // available and exactly one execution's `recv` is recorded. Adopting the rival's answer
-            // instead would be defensible, but nothing in this crate does that: the same conflict
-            // from `run_transactional_step` and from `get_event` reaches the caller, and two
-            // executors believing they own one workflow is worth reporting rather than smoothing
-            // over.
+            // **A conflict here is reported, and the rollback is what makes that safe.** With the
+            // owner check first it can only be this execution recording the step twice, which is
+            // nondeterminism; dropping the transaction un-takes whatever this attempt took, so the
+            // message stays available.
             self.record_step_on(
                 &mut tx,
                 workflow_id,
@@ -5011,6 +4992,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         value: &str,
         serialization: Option<&str>,
         written_by: WrittenBy,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         // Derived, not passed: a close is recorded as a close whichever entry point reached it.
         // The label is part of the match, so a user value that encodes to the same text is not.
@@ -5042,6 +5024,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "write_stream", move || async move {
             for attempt in 0..STREAM_OFFSET_ATTEMPTS {
                 let mut tx = pool.begin().await?;
+                // A write made inside a step is checked as one made by the workflow is: either
+                // way the execution writing it must still own the workflow.
+                self.check_owner_on(
+                    &mut tx,
+                    WorkflowOwner {
+                        workflow_id,
+                        owner_xid,
+                    },
+                )
+                .await?;
 
                 // A replay must not append a second entry. Only a workflow-level write records a
                 // step to find: one made inside a step is replayed by its step being replayed.
@@ -5124,6 +5116,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         key: &str,
         written_by: WrittenBy,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         self.write_stream(
             workflow_id,
@@ -5132,6 +5125,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             STREAM_CLOSED,
             Some(STREAM_CLOSED_SERIALIZATION),
             written_by,
+            owner_xid,
         )
         .await
     }
@@ -5199,12 +5193,21 @@ impl SystemDatabase for PostgresSystemDatabase {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "record_step", move || async move {
-            let mut conn = pool.acquire().await?;
+            let mut tx = pool.begin().await?;
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
             self.record_step_on(
-                &mut conn,
+                &mut tx,
                 workflow_id,
                 step_id,
                 step_name,
@@ -5213,11 +5216,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                 timing,
                 None,
             )
-            .await
+            .await?;
+            tx.commit().await?;
+            Ok(())
         })
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_child_result(
         &self,
         parent_workflow_id: &str,
@@ -5226,12 +5232,21 @@ impl SystemDatabase for PostgresSystemDatabase {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "record_child_result", move || async move {
-            let mut conn = pool.acquire().await?;
+            let mut tx = pool.begin().await?;
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id: parent_workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
             self.record_step_on(
-                &mut conn,
+                &mut tx,
                 parent_workflow_id,
                 step_id,
                 step_names::GET_RESULT,
@@ -5240,7 +5255,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 timing,
                 Some(child_workflow_id),
             )
-            .await
+            .await?;
+            tx.commit().await?;
+            Ok(())
         })
         .await
     }
@@ -5282,9 +5299,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         step_id: i32,
         duration: Duration,
+        owner_xid: &str,
     ) -> Result<Timestamp, Error> {
-        self.checkpoint_sleep(workflow_id, step_id, duration, SleepKind::Durable)
-            .await
+        self.checkpoint_sleep(
+            workflow_id,
+            step_id,
+            duration,
+            SleepKind::Durable,
+            owner_xid,
+        )
+        .await
     }
 
     async fn set_event(
@@ -5294,12 +5318,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         key: &str,
         value: &str,
         serialization: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let events = &self.tables.workflow_events;
         let history = &self.tables.workflow_events_history;
         let (events, history, pool) = (events.as_str(), history.as_str(), &self.pool);
         // Fixed before the retry, like every other step token: a second attempt is recording the
-        // same step, and a fresh clock reading would look like a rival execution.
+        // same step, and a fresh clock reading would look like a step recorded twice.
         let timing = StepTiming {
             started_at: Timestamp::now(),
             completed_at: Timestamp::now(),
@@ -5307,6 +5332,14 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(&self.retry, "set_event", move || async move {
             let mut tx = pool.begin().await?;
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
 
             // A replay that already published this key must not publish it again — and must not
             // be told it failed either.
@@ -5425,6 +5458,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     caller.timeout_step_id,
                     timeout,
                     SleepKind::Deadline,
+                    caller.owner_xid,
                 )
                 .await?
             }
@@ -5500,8 +5534,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             return Ok(found);
         };
 
-        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
-        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        // Fixed here rather than inside the retry: `completed_at` is also what recognises this
+        // caller's own re-attempt after a lost acknowledgement, so it must not move between
+        // attempts.
         let timing = StepTiming {
             started_at,
             completed_at: Timestamp::now(),
@@ -5513,6 +5548,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         // exactly when another execution of this workflow would have recorded its own answer.
         with_retry(&self.retry, "get_event", move || async move {
             let mut tx = pool.begin().await?;
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id: caller.workflow_id,
+                    owner_xid: caller.owner_xid,
+                },
+            )
+            .await?;
             if let Some(step) = self
                 .check_step_on(
                     &mut tx,
@@ -5527,7 +5570,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     workflow_id = caller.workflow_id,
                     step_id = caller.step_id,
                     key,
-                    "adopting a rival execution's get_event"
+                    "replaying get_event"
                 );
                 return Ok(step.output.map(|value| EncodedValue {
                     value,
@@ -5808,7 +5851,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         let versions_table = &self.tables.application_versions;
         // Generated outside the retry, like every other identity here. It matters less than
-        // `owner_xid` does — a retry finds the row already there and claims nothing — but the
+        // `creator_xid` does — a retry finds the row already there and claims nothing — but the
         // rule is worth keeping uniform.
         let version_id = uuid::Uuid::new_v4().to_string();
         let (versions_table, pool, version_id) =
@@ -6108,11 +6151,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_queued_workflows(
         &self,
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        owner_xid: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
         partition_local_running_count: i64,
@@ -6402,6 +6447,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 let flipped: HashSet<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $2, application_version = $3, \
+                         owner_xid = $6, \
                          started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = $4, \
                          updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $1), \
@@ -6421,6 +6467,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(application_version)
                 .bind(rate_limited)
                 .bind(candidates.as_slice())
+                .bind(owner_xid)
                 .fetch_all(&mut *tx)
                 .await?
                 .into_iter()
@@ -6484,6 +6531,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        owner_xid: &str,
         max_tasks: Option<i64>,
     ) -> Result<Vec<String>, Error> {
         // The sweep admits one row per partition and counts nothing, so it is only correct where
@@ -6688,6 +6736,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
+                         owner_xid = $6, \
                          started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
                          updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $4), \
@@ -6705,6 +6754,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(application_version)
                 .bind(application_name)
                 .bind(executor_id)
+                .bind(owner_xid)
                 .fetch_all(&mut *tx)
                 .await?;
 
@@ -7625,19 +7675,30 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         step_name: &str,
         started_at: Option<Timestamp>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "record_child_workflow", move || async move {
-            let mut conn = pool.acquire().await?;
+            let mut tx = pool.begin().await?;
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id: parent_workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
             self.record_child_workflow_on(
-                &mut conn,
+                &mut tx,
                 parent_workflow_id,
                 child_workflow_id,
                 step_id,
                 step_name,
                 started_at,
             )
-            .await
+            .await?;
+            tx.commit().await?;
+            Ok(())
         })
         .await
     }
@@ -7657,6 +7718,7 @@ impl PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
         step_name: &'static str,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error> {
         // An empty batch still records its step. The workflow spent a step id on this call, and a
         // step id that nothing occupies is a hole a replay has to guess about: the caller would
@@ -7719,6 +7781,11 @@ impl PostgresSystemDatabase {
 
         with_retry(&self.retry, "send_messages", move || async move {
             let mut tx = pool.begin().await?;
+            // The sending execution, from a workflow or from inside one of its steps, must still
+            // own its workflow; a refusal rolls the delivery back.
+            if let Some(owner) = owner {
+                self.check_owner_on(&mut tx, owner).await?;
+            }
 
             // A replay must not send again — and must not be told it failed either.
             if let Some((workflow_id, step_id)) = caller
@@ -8070,11 +8137,12 @@ mod tests {
             workflow_id: "wf-caller",
             step_id: 0,
             codec: &UnitCodec,
+            owner_xid: crate::context::TEST_OWNER,
         })
     }
 
-    /// A migrated database holding one `PENDING` workflow, `wf-caller`, for the runner to record
-    /// steps against.
+    /// A migrated database holding one `PENDING` workflow, `wf-caller`, owned by
+    /// [`TEST_OWNER`](crate::context::TEST_OWNER), for the runner to record steps against.
     async fn caller() -> (PostgresSystemDatabase, dbos_test_support::TestDatabase) {
         let db = dbos_test_support::test_database().await;
         let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
@@ -8084,10 +8152,10 @@ mod tests {
                 ..NewWorkflow::new("wf-caller")
             },
             None,
-            None,
         )
         .await
         .expect("init_workflow failed");
+        crate::context::own_for_test(&db, "wf-caller").await;
         (sys, db)
     }
 
@@ -8247,6 +8315,7 @@ mod tests {
             Outcome::Output(Some("1")),
             Some("pickle"),
             None,
+            crate::context::TEST_OWNER,
         )
         .await
         .unwrap();
@@ -8481,24 +8550,24 @@ mod tests {
         .await
         .expect("connect failed");
 
-        sys.init_workflow(&NewWorkflow::new("wf-idle"), None, None)
+        sys.init_workflow(&NewWorkflow::new("wf-idle"), None)
             .await
             .unwrap();
         let table = sys.tables.workflow_status.as_str();
         let mut idle = sys.pool.begin().await.unwrap();
         sqlx::query(AssertSqlSafe(format!(
-            "SELECT status FROM {table} WHERE workflow_uuid = 'wf-idle' FOR NO KEY UPDATE"
+            "SELECT owner_xid FROM {table} WHERE workflow_uuid = 'wf-idle' FOR NO KEY UPDATE"
         )))
         .execute(&mut *idle)
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        // The lock went with the session, so another write goes through at once.
+        // The lock went with the session, so a hand-off goes through at once.
         let other = db.pool().await;
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET updated_at = updated_at WHERE workflow_uuid = 'wf-idle'"
+                "UPDATE {table} SET owner_xid = NULL WHERE workflow_uuid = 'wf-idle'"
             )))
             .execute(&other),
         )

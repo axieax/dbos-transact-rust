@@ -74,7 +74,23 @@ use crate::context::Ctx;
 use crate::error::{DurableError, Error};
 use crate::instance::Executor;
 use crate::serialization::{PayloadEncoding, Serializer, decode_error};
-use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
+use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowOwner};
+
+/// Where a recorded call sits in its workflow: what a replay reads back, and all it needs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StepPosition<'a> {
+    pub(crate) workflow_id: &'a str,
+    pub(crate) step_id: i32,
+}
+
+/// Who writes at a recorded call's position: the step, and the token of the execution making it,
+/// which the write presents so it lands only while that execution still owns the workflow.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StepWriter<'a> {
+    pub(crate) workflow_id: &'a str,
+    pub(crate) step_id: i32,
+    pub(crate) owner_xid: &'a str,
+}
 
 /// What a durable call works out at the call, before anything of it has run.
 ///
@@ -743,7 +759,8 @@ impl StepPlacement {
     }
 
     /// The workflow making this call, recorded or not: `Some` inside a step body too, where
-    /// [`step`](Self::step) is `None`. `None` outside a workflow and through a client.
+    /// [`step_position`](Self::step_position) is `None`. `None` outside a workflow and through a
+    /// client.
     pub(crate) fn workflow_id(&self) -> Option<&str> {
         match self {
             Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Some(ctx.workflow_id()),
@@ -751,10 +768,36 @@ impl StepPlacement {
         }
     }
 
-    /// The workflow and step id this call is recorded under, if it is recorded at all.
-    pub(crate) fn step(&self) -> Option<(&str, i32)> {
+    /// The workflow and step id this call is recorded under, if it is recorded at all: what a
+    /// replay read needs, which is not fenced.
+    pub(crate) fn step_position(&self) -> Option<StepPosition<'_>> {
         match self {
-            Self::Recorded { ctx, step_id } => Some((ctx.workflow_id(), *step_id)),
+            Self::Recorded { ctx, step_id } => Some(StepPosition {
+                workflow_id: ctx.workflow_id(),
+                step_id: *step_id,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The step this call is recorded under and the execution writing it, if it is recorded:
+    /// what a fenced write presents.
+    pub(crate) fn step_writer(&self) -> Option<StepWriter<'_>> {
+        match self {
+            Self::Recorded { ctx, step_id } => Some(StepWriter {
+                workflow_id: ctx.workflow_id(),
+                step_id: *step_id,
+                owner_xid: ctx.owner_xid(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The execution this call is made by, wherever there is one: in the workflow proper, and
+    /// inside one of its steps. Its writes land only while it still owns its workflow.
+    pub(crate) fn owner(&self) -> Option<WorkflowOwner<'_>> {
+        match self {
+            Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Some(ctx.owner()),
             _ => None,
         }
     }
@@ -794,7 +837,11 @@ impl StepPlacement {
         conn: &Connection,
         step_name: &str,
     ) -> Result<Option<StepRecord>, Error> {
-        let Some((workflow_id, step_id)) = self.step() else {
+        let Some(StepPosition {
+            workflow_id,
+            step_id,
+        }) = self.step_position()
+        else {
             return Ok(None);
         };
         conn.sysdb()
@@ -807,8 +854,8 @@ impl StepPlacement {
     ///
     /// `started_at` is when the operation began rather than when it finished being written down,
     /// so a workflow's timeline shows the wait. It is paired with a completion stamped here, and
-    /// the pair is what makes the write idempotent for this caller and a conflict for a rival —
-    /// see [`StepTiming::completed_at`].
+    /// the pair is what makes the write idempotent for this caller's retry and a conflict for a
+    /// step recorded twice — see [`StepTiming::completed_at`].
     ///
     /// A no-op where nothing is checkpointed, so a caller need not branch: the placement already
     /// decided, and repeating the decision at every call site is how the two halves drift apart.
@@ -821,7 +868,12 @@ impl StepPlacement {
         outcome: Outcome<'_>,
         started_at: Timestamp,
     ) -> Result<(), Error> {
-        let Some((workflow_id, step_id)) = self.step() else {
+        let Some(StepWriter {
+            workflow_id,
+            step_id,
+            owner_xid,
+        }) = self.step_writer()
+        else {
             return Ok(());
         };
         conn.sysdb()
@@ -835,6 +887,7 @@ impl StepPlacement {
                     started_at,
                     completed_at: Timestamp::now(),
                 }),
+                owner_xid,
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -870,6 +923,7 @@ mod tests {
         let proper = Ctx::new(
             dbos.executor("test").expect("launched"),
             "wf",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );
@@ -966,6 +1020,7 @@ mod tests {
         let other = Ctx::new(
             dbos.executor("test").expect("launched"),
             "wf-other",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );
@@ -975,6 +1030,7 @@ mod tests {
         let rerun = Ctx::new(
             dbos.executor("test").expect("launched"),
             "wf",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );

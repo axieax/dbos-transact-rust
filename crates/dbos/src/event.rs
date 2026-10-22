@@ -26,7 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepPlacement};
+use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
@@ -90,12 +90,24 @@ where
             // `set_event` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — the `else` is unreachable and says so rather than inventing a
             // second meaning for a write with no id.
-            let Some((workflow_id, step_id)) = placement.step() else {
+            let Some(StepWriter {
+                workflow_id,
+                step_id,
+                owner_xid,
+            }) = placement.step_writer()
+            else {
                 unreachable!("set_event is refused outside a workflow and inside a step")
             };
             executor
                 .sysdb()
-                .set_event(workflow_id, step_id, key, &encoded, Some(encoding.name()))
+                .set_event(
+                    workflow_id,
+                    step_id,
+                    key,
+                    &encoded,
+                    Some(encoding.name()),
+                    owner_xid,
+                )
                 .await
                 .map_err(Error::SystemDatabase)?;
             Ok(())
@@ -287,13 +299,16 @@ where
             // `caller_id` is the workflow *making* the read, which is what the checkpoint hangs
             // off; `workflow_id` above is the one being read from, and the two are rarely the
             // same.
-            let caller = placement.step().zip(timeout_step_id).map(
-                |((caller_id, step_id), timeout_step_id)| GetEventCaller {
-                    workflow_id: caller_id,
-                    step_id,
-                    timeout_step_id,
-                },
-            );
+            let caller =
+                placement
+                    .step_writer()
+                    .zip(timeout_step_id)
+                    .map(|(caller, timeout_step_id)| GetEventCaller {
+                        workflow_id: caller.workflow_id,
+                        step_id: caller.step_id,
+                        timeout_step_id,
+                        owner_xid: caller.owner_xid,
+                    });
             executor
                 .connection()
                 .get_event(workflow_id, key, timeout, caller)

@@ -40,6 +40,7 @@
 
 use std::time::Duration;
 
+use crate::checkpoint::StepWriter;
 use crate::config::Config;
 use crate::serialization::Serializer;
 use crate::sysdb::types::StepCaller;
@@ -189,19 +190,20 @@ impl Connection {
         &self.serializer
     }
 
-    /// The system database's view of a call recorded as step `step_id` of `workflow_id`: the ids,
-    /// and this connection's serializer to record the call's result in.
+    /// The system database's view of a call recorded as a step: the ids, the calling execution's
+    /// token, and this connection's serializer to record the call's result in.
     ///
     /// The result is a checkpoint only this SDK replays, so it is written in the configured
     /// serializer, as a step's output is.
     pub(crate) fn step_caller<'a>(
         &'a self,
-        caller: Option<(&'a str, i32)>,
+        caller: Option<StepWriter<'a>>,
     ) -> Option<StepCaller<'a>> {
-        caller.map(|(workflow_id, step_id)| StepCaller {
-            workflow_id,
-            step_id,
+        caller.map(|caller| StepCaller {
+            workflow_id: caller.workflow_id,
+            step_id: caller.step_id,
             codec: &self.serializer,
+            owner_xid: caller.owner_xid,
         })
     }
 

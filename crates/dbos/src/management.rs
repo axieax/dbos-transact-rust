@@ -74,8 +74,8 @@
 //! its own, and there is no wrapper left to record one: the atomic version costs the same round
 //! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
 //! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
-//! a second id; and two executions of one workflow racing here both find no checkpoint, where the
-//! transaction lets only the one that wins the step row commit its write.
+//! a second id; and an execution that has been handed off is refused by the owner check before
+//! the write, in the same transaction, so its work never lands.
 //!
 //! **Go draws the same line, from the other side.** Its writes go through `runAsTxn` and its reads
 //! through the plain `RunAsStep`; Python, TypeScript and Java run the whole surface through their
@@ -119,7 +119,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::checkpoint::{PendingStep, StepPlacement};
+use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
@@ -433,7 +433,7 @@ impl DBOS {
                         &[workflow_id],
                         Children::Skip,
                         placement.workflow_id(),
-                        placement.step(),
+                        placement.step_writer(),
                     )
                     .await?;
                 Ok(())
@@ -480,7 +480,7 @@ impl DBOS {
                         workflow_ids,
                         children,
                         placement.workflow_id(),
-                        placement.step(),
+                        placement.step_writer(),
                     )
                     .await
             },
@@ -503,18 +503,16 @@ impl DBOS {
     ///
     /// # Resuming a workflow that is still running
     ///
-    /// **Nothing checks for one, except a workflow resuming itself.** That is refused as
-    /// [`Error::SystemDatabase`] carrying `InvalidInput`, from the workflow's own code or one of
-    /// its steps, though not through a [`Client`](crate::Client) or from a task it spawned, as
-    /// [`cancel`](Self::cancel) describes. Otherwise not being terminal is the whole guard, so a
-    /// `PENDING` row passes — and `PENDING` means *some executor owns this*, not *this has
-    /// stopped*. Resuming a workflow that is executing right now re-enqueues it underneath its own
-    /// execution: the next sweep claims the row and dispatches it, and two executions of one id run
-    /// concurrently. Neither is told about the other, and the running one is not cancelled, so
-    /// nothing stops it at its next step — see the module documentation on why cancelling is the
-    /// only thing step preemption watches for. Both run to a conclusion, one records the outcome
-    /// and the other's write is refused; the row is then tidy, but any step neither had
-    /// checkpointed is performed twice, side effects included.
+    /// **Allowed, except a workflow resuming itself, and it hands the workflow over.** Resuming
+    /// itself is refused as [`Error::SystemDatabase`] carrying `InvalidInput`, from the workflow's
+    /// own code or one of its steps, though not through a [`Client`](crate::Client) or from a task
+    /// it spawned, as [`cancel`](Self::cancel) describes. Otherwise not being terminal is the whole
+    /// guard, so a `PENDING` row passes — and `PENDING` means *some executor owns this*, not *this
+    /// has stopped*. Resuming a workflow that is executing right now re-enqueues it and takes it
+    /// from its execution: the next sweep claims the row and dispatches a new one, and the old
+    /// one's next write is refused, so it stops there and its caller gets the new one's outcome. A
+    /// step the old one was running when the hand-off came runs again in the new one, side effects
+    /// included.
     ///
     /// **[`cancel`](Self::cancel) first if the workflow may be live.** That gives the running
     /// execution something to observe, so it abandons its attempt at the next preemptible step
@@ -568,7 +566,7 @@ impl DBOS {
                         &[workflow_id],
                         options,
                         placement.workflow_id(),
-                        placement.step(),
+                        placement.step_writer(),
                     )
                     .await?
                     .pop()
@@ -608,7 +606,7 @@ impl DBOS {
                         workflow_ids,
                         options,
                         placement.workflow_id(),
-                        placement.step(),
+                        placement.step_writer(),
                     )
                     .await
             },
@@ -689,7 +687,7 @@ impl DBOS {
                         start_step,
                         options.forked_id,
                         &options,
-                        placement.step(),
+                        placement.step_writer(),
                     )
                     .await?
                     .pop()
@@ -737,7 +735,13 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .fork_all(workflow_ids, start_step, None, &options, placement.step())
+                    .fork_all(
+                        workflow_ids,
+                        start_step,
+                        None,
+                        &options,
+                        placement.step_writer(),
+                    )
                     .await
             },
         )
@@ -832,7 +836,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .rewind(workflow_id, options, placement.step())
+                    .rewind(workflow_id, options, placement.step_writer())
                     .await
             },
         )
@@ -865,7 +869,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .delete_all(&[workflow_id], Children::Skip, placement.step())
+                    .delete_all(&[workflow_id], Children::Skip, placement.step_writer())
                     .await?;
                 Ok(())
             },
@@ -904,7 +908,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .delete_all(workflow_ids, children, placement.step())
+                    .delete_all(workflow_ids, children, placement.step_writer())
                     .await
             },
         )
@@ -949,7 +953,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .set_workflow_delay(workflow_id, delay, placement.step())
+                    .set_workflow_delay(workflow_id, delay, placement.step_writer())
                     .await
             },
         )
@@ -1004,7 +1008,11 @@ impl DBOS {
             move |(executor, encoded), placement| async move {
                 executor
                     .connection()
-                    .update_workflow_attributes(workflow_id, encoded.as_deref(), placement.step())
+                    .update_workflow_attributes(
+                        workflow_id,
+                        encoded.as_deref(),
+                        placement.step_writer(),
+                    )
                     .await
             },
         )
@@ -1050,7 +1058,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .list_workflows(filter, placement.step())
+                    .list_workflows(filter, placement.step_writer())
                     .await
             },
         )
@@ -1092,7 +1100,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .list_workflow_steps(workflow_id, options, placement.step())
+                    .list_workflow_steps(workflow_id, options, placement.step_writer())
                     .await
             },
         )
@@ -1392,7 +1400,7 @@ impl Connection {
         workflow_ids: &[&str],
         children: Children,
         from_workflow: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<String>> {
         let cancelled = self
             .sysdb()
@@ -1419,7 +1427,7 @@ impl Connection {
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
         from_workflow: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let resumed = self
             .sysdb()
@@ -1453,7 +1461,7 @@ impl Connection {
         start_step: i32,
         forked_id: Option<&str>,
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let sys_options = SysForkOptions {
             application_version: options.app_version,
@@ -1493,7 +1501,7 @@ impl Connection {
         self: &Arc<Self>,
         workflow_id: &str,
         options: RewindOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<WorkflowHandle<R, E>> {
         let sys_options = SysRewindOptions {
             application_version: options.app_version,
@@ -1527,7 +1535,7 @@ impl Connection {
         &self,
         workflow_ids: &[&str],
         children: Children,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<u64> {
         let deleted = self
             .sysdb()
@@ -1549,7 +1557,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .set_workflow_delay(workflow_id, delay, self.step_caller(caller))
@@ -1573,7 +1581,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         encoded: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .update_workflow_attributes(workflow_id, encoded, self.step_caller(caller))
@@ -1589,7 +1597,7 @@ impl Connection {
     pub(crate) async fn list_workflows(
         &self,
         filter: &WorkflowFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<WorkflowRecord>> {
         self.sysdb()
             .list_workflows(filter, self.step_caller(caller))
@@ -1602,7 +1610,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         options: ListWorkflowStepsOptions,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<StepRecord>> {
         self.sysdb()
             .list_workflow_steps(

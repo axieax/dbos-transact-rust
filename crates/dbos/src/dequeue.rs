@@ -379,13 +379,17 @@ async fn poll_once(
     queue: &QueueRecord,
     running: &Arc<Running>,
 ) -> Option<Contention> {
+    // One token per claim: every row a claim takes is owned by it.
+    let owner_xid = || uuid::Uuid::new_v4().to_string();
     if !queue.is_partitioned() {
+        let owner_xid = owner_xid();
         return match executor
             .sysdb()
             .start_queued_workflows(
                 queue,
                 executor.executor_id(),
                 executor.app_version(),
+                &owner_xid,
                 None,
                 running.count(&queue.name),
                 0,
@@ -393,7 +397,7 @@ async fn poll_once(
             .await
         {
             Ok(claimed) => {
-                dispatch_claimed(executor, queue, None, running, claimed).await;
+                dispatch_claimed(executor, queue, None, running, claimed, &owner_xid).await;
                 None
             }
             Err(error) => report_dequeue_error(&error),
@@ -416,12 +420,14 @@ async fn poll_once(
         && queue.rate_limit.is_none()
         && queue.partition_rate_limit.is_none()
     {
+        let owner_xid = owner_xid();
         return match executor
             .sysdb()
             .start_queued_partitioned_workflows(
                 queue,
                 executor.executor_id(),
                 executor.app_version(),
+                &owner_xid,
                 budget,
             )
             .await
@@ -429,7 +435,7 @@ async fn poll_once(
             Ok(claimed) => {
                 // The sweep returns one head per partition and does not say which; each claimed
                 // row carries its own key, so the tally is credited from the rows themselves.
-                dispatch_claimed(executor, queue, None, running, claimed).await;
+                dispatch_claimed(executor, queue, None, running, claimed, &owner_xid).await;
                 None
             }
             Err(error) => report_dequeue_error(&error),
@@ -446,12 +452,14 @@ async fn poll_once(
         if worker_budget(queue, already_running + claimed_here) == Some(0) {
             break;
         }
+        let owner_xid = owner_xid();
         let claimed = match executor
             .sysdb()
             .start_queued_workflows(
                 queue,
                 executor.executor_id(),
                 executor.app_version(),
+                &owner_xid,
                 Some(&partition),
                 already_running + claimed_here,
                 running.count_for_partition(&queue.name, &partition),
@@ -477,7 +485,15 @@ async fn poll_once(
             }
         };
         claimed_here += i64::try_from(claimed.len()).unwrap_or(i64::MAX);
-        dispatch_claimed(executor, queue, Some(&partition), running, claimed).await;
+        dispatch_claimed(
+            executor,
+            queue,
+            Some(&partition),
+            running,
+            claimed,
+            &owner_xid,
+        )
+        .await;
     }
     None
 }
@@ -521,6 +537,7 @@ async fn dispatch_claimed(
     partition: Option<&str>,
     running: &Arc<Running>,
     claimed: Vec<String>,
+    owner_xid: &str,
 ) {
     if claimed.is_empty() {
         return;
@@ -599,7 +616,7 @@ async fn dispatch_claimed(
         // Claimed before the dispatch, so the next iteration's counts include it even if this one
         // is still starting. `dispatch` drops the slot itself if it does not spawn.
         let slot = running.claim(&queue.name, partition);
-        if let Err(error) = dispatch(executor, row, clock, Some(slot)).await {
+        if let Err(error) = dispatch(executor, row, owner_xid, clock, Some(slot)).await {
             tracing::warn!(
                 workflow_id,
                 error = %error,
@@ -614,9 +631,15 @@ async fn dispatch_claimed(
 ///
 /// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
 /// describes — look the registration up by the row's own name, check the row is still `PENDING`,
-/// and spawn — and that is what this does. It takes the row rather than fetching it because the
-/// claim already read every row it took in one round trip, which is the reason
-/// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
+/// and spawn — and that is what this does. It takes the row rather than
+/// fetching it because the claim already read every row it took in one round trip, which is the
+/// reason [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns
+/// ids.
+///
+/// `owner_xid` is the claim's token. The execution presents it on every write, so if the row is
+/// handed to another execution since the claim (a resume, a recovery), this one's first write is
+/// refused. That is the only check of ownership here: a row claimed again before the read is
+/// `PENDING` and runs, and its first step's body runs before that write is refused.
 ///
 /// **The registry is consulted after the row is claimed, and that is harmless rather than
 /// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
@@ -635,6 +658,7 @@ async fn dispatch_claimed(
 async fn dispatch(
     executor: &Arc<Executor>,
     row: WorkflowRecord,
+    owner_xid: &str,
     clock: DatabaseTime,
     slot: Option<Slot>,
 ) -> crate::Result<()> {
@@ -710,6 +734,7 @@ async fn dispatch(
         executor,
         key,
         workflow_id,
+        owner_xid.to_owned(),
         row.input,
         // The row's own tag, which is how its input was written — by this SDK or another.
         row.serialization,
@@ -792,7 +817,8 @@ enum Admission {
     /// Parked, once it has been dispatched more often than allowed. The claim counted this
     /// attempt; a workflow that keeps being recovered without finishing is crashing its
     /// executors, and running it again would crash another. The park's guard on the count leaves
-    /// a row alone that a resume reset meanwhile.
+    /// a row alone that a resume reset meanwhile. A row another claim has taken since is parked
+    /// too, and rightly: that claim counted one more attempt, so its own dispatch would park it.
     Park,
 }
 
@@ -875,6 +901,101 @@ mod tests {
             contention(&sysdb::Error::Malformed("bad row".to_owned())),
             None
         );
+    }
+
+    /// **A claimed row that has been claimed again since runs, but records nothing.** It is
+    /// `PENDING` under another claim's token, so its body runs and its outcome write is refused;
+    /// the row stays the owner's, and the owner's run is the one that records the outcome.
+    #[tokio::test]
+    async fn a_row_claimed_again_since_records_nothing() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..crate::Config::new("dispatch-test", db.url())
+        });
+        let runs = Arc::new(AtomicU32::new(0));
+        let dbos_runs = Arc::clone(&runs);
+        dbos.register_workflow("counted", move |()| {
+            let runs = Arc::clone(&dbos_runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>(())
+            }
+        })
+        .unwrap();
+        dbos.launch().await.expect("launch failed");
+        let executor = dbos.executor("test").expect("launched");
+        executor
+            .sysdb()
+            .init_workflow(
+                &crate::sysdb::types::NewWorkflow {
+                    name: Some("counted"),
+                    input: Some("null"),
+                    serialization: Some("rust_serde"),
+                    ..crate::sysdb::types::NewWorkflow::new("wf-reclaimed")
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let row = || async {
+            executor
+                .sysdb()
+                .get_workflow("wf-reclaimed")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let owner = row().await.owner_xid.expect("a started row is owned");
+
+        dispatch(
+            &executor,
+            row().await,
+            "an-earlier-claim",
+            local_clock(),
+            None,
+        )
+        .await
+        .unwrap();
+        let ran = |n: u32| {
+            let runs = Arc::clone(&runs);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while runs.load(Ordering::SeqCst) < n {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "run {n} never started"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        ran(1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let held = row().await;
+        assert_eq!(
+            held.status,
+            WorkflowStatus::Pending,
+            "a stale claim settled it"
+        );
+        assert_eq!(held.owner_xid.as_deref(), Some(owner.as_str()));
+
+        dispatch(&executor, row().await, &owner, local_clock(), None)
+            .await
+            .unwrap();
+        ran(2).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while row().await.status != WorkflowStatus::Success {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the owner's run never recorded its outcome"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        dbos.shutdown().await;
     }
 
     /// A row that moved on since the claim is not started, and is not parked either, however many

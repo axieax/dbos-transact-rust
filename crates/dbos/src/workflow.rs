@@ -664,11 +664,7 @@ pub(crate) async fn init_or_join(
     caller: Option<InitWorkflowCaller<'_>>,
 ) -> Result<Submitted> {
     loop {
-        match conn
-            .sysdb()
-            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), caller)
-            .await
-        {
+        match conn.sysdb().init_workflow(new, caller).await {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
             // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
@@ -1298,6 +1294,7 @@ async fn create<R, E>(
             // which records the joined case under the same one.
             step_name: &key.name,
             started_at,
+            owner_xid: parent.owner_xid(),
         }),
     )
     .await
@@ -1368,13 +1365,12 @@ async fn create<R, E>(
         ));
     }
 
-    // Someone else owns this row — the id was supplied and a previous run has it, or another
-    // executor claimed it first. Joining rather than erroring is what makes a retried request
-    // idempotent, and it is where Python waits too.
+    // Someone else created this row: the id was supplied and a previous call made it. Joining
+    // rather than erroring is what makes a retried request idempotent.
     if !initialized.should_execute {
         tracing::debug!(
             workflow_id,
-            "the workflow is already owned; the handle joins the existing run"
+            "another caller created the workflow; the handle joins it"
         );
         // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read this
         // row, and it is the case the references pass their own flag on — Python parks its unowned
@@ -1387,10 +1383,7 @@ async fn create<R, E>(
         ));
     }
 
-    // **The row's input and encoding, not this caller's.** A row this call found rather than
-    // created keeps the input and the tag it was written with, and a recovery of it would run
-    // those — so the run does too, rather than the input this caller offered and never wrote.
-    let input = initialized.existing_input.unwrap_or(input);
+    // The row's encoding, which is this caller's own: it created the row.
     let serialization = initialized.serialization;
     // The deadline the *database* holds, not the one this caller offered: `init_workflow`
     // turns a budget into an instant against its own clock, and an existing row keeps the
@@ -1399,6 +1392,8 @@ async fn create<R, E>(
         executor,
         key.clone(),
         workflow_id.clone(),
+        // The row was inserted `PENDING`, so its creator owns it from the start.
+        initialized.creator_xid,
         input,
         serialization,
         Deadline::of(initialized.deadline, initialized.clock),
@@ -1694,6 +1689,12 @@ impl Parent<'_> {
         self.ctx.workflow_id()
     }
 
+    /// The token the parent's execution owns it by, which every write recording the start
+    /// presents: a parent that has been handed off starts nothing.
+    fn owner_xid(&self) -> &str {
+        self.ctx.owner_xid()
+    }
+
     /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
     fn deadline(&self) -> Option<Timestamp> {
         self.ctx.deadline()
@@ -1731,6 +1732,7 @@ impl Parent<'_> {
                 workflow_id: self.workflow_id(),
                 step_id: self.step_id,
                 codec: executor.serializer(),
+                owner_xid: self.owner_xid(),
             };
             let value: serde_json::Value =
                 decode_step_value(&recorded, encoded, caller, step_name, "an error")
@@ -1772,13 +1774,12 @@ impl Parent<'_> {
     ///
     /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
     ///   returns it again on a replay.
-    /// - **The record fails**: that failure is returned instead, and the position usually stays
-    ///   unrecorded. A rival that recorded it first is
-    ///   [`StepAlreadyRecorded`](crate::sysdb::Error::StepAlreadyRecorded): this execution is
-    ///   superseded. The record is the step row and then the executor claim, as for any step; if
-    ///   the claim fails after the row lands, the caller gets the claim's error but the row stays,
-    ///   so a replay returns the recorded error. The claim's error is database trouble, which
-    ///   leaves the parent `PENDING` rather than ending it.
+    /// - **The record fails**: that failure is returned instead, and the position stays
+    ///   unrecorded, since the record is one transaction. A position recorded already is
+    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
+    ///   a parent no longer this execution's is
+    ///   [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict). Database trouble leaves the
+    ///   parent `PENDING` rather than ending it.
     /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
     ///   encoding failure is returned and the error logged, so the position stays unrecorded
     ///   rather than the parent acting on an answer nothing recorded.
@@ -1818,6 +1819,7 @@ impl Parent<'_> {
                 Outcome::Error(&recorded.value),
                 recorded.serialization.as_deref(),
                 Some(timing),
+                self.owner_xid(),
             )
             .await
         {
@@ -1863,6 +1865,7 @@ impl Parent<'_> {
                 self.step_id,
                 step_name,
                 Some(started_at),
+                self.owner_xid(),
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -1883,10 +1886,15 @@ impl Parent<'_> {
 /// aborting it, without anything having to watch for the end. The one earlier release is an
 /// execution another one has overtaken, which [`adopt_superseded`] gives up before it waits. Every
 /// other submitter passes `None`.
+///
+/// `owner_xid` is the token the execution owns the workflow by: the creator token of a direct
+/// start that inserted the row, or the token of the claim that dequeued it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
     key: WorkflowKey,
     workflow_id: String,
+    owner_xid: String,
     input: Option<String>,
     serialization: Option<String>,
     deadline: Option<Deadline>,
@@ -1913,6 +1921,7 @@ pub(crate) fn spawn_execution(
                 let ctx = Ctx::new(
                     Arc::clone(&executor),
                     &workflow_id,
+                    owner_xid,
                     deadline.map(|deadline| deadline.at),
                     encoding.clone(),
                 );
@@ -1999,7 +2008,7 @@ enum Ended {
 /// Records the timeout of a workflow whose local timer fired, and settles on what the row holds.
 ///
 /// **Cancelled only if the database's clock says the deadline has passed**, the same test the
-/// timeout sweep makes. The timer is measured on that clock, so the two normally agree; the test is
+/// timeout sweep makes, and only while this execution still owns the workflow. The timer is measured on that clock, so the two normally agree; the test is
 /// what keeps a timer that fires a moment early, inside a reading's millisecond, from cancelling a
 /// workflow early.
 ///
@@ -2013,10 +2022,15 @@ enum Ended {
 async fn time_out(
     executor: &Executor,
     workflow_id: &str,
+    owner_xid: &str,
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
     drop(slot);
-    match executor.sysdb().cancel_if_timed_out(workflow_id).await {
+    match executor
+        .sysdb()
+        .cancel_if_timed_out(workflow_id, owner_xid)
+        .await
+    {
         Ok(true) => {
             tracing::info!(
                 workflow_id,
@@ -2060,6 +2074,8 @@ async fn execute(
         .body
         .clone();
 
+    // Kept for the outcome write, which only lands while this execution still owns the workflow.
+    let owner_xid = ctx.owner_xid().to_owned();
     let outcome = match run_until_deadline(
         expires,
         Ctx::scope(ctx, async move {
@@ -2070,31 +2086,31 @@ async fn execute(
     .await
     {
         Ended::Body(outcome) => outcome,
-        Ended::DeadlinePassed => return time_out(executor, workflow_id, slot).await,
+        Ended::DeadlinePassed => return time_out(executor, workflow_id, &owner_xid, slot).await,
     };
 
     let write = match &outcome {
         Ok(output) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Output(output.encoded.as_deref()))
+                .record_workflow_outcome(
+                    workflow_id,
+                    Outcome::Output(output.encoded.as_deref()),
+                    &owner_xid,
+                )
                 .await
         }
-        // Another execution checkpointed a step this one was about to, so it is ahead and this
-        // one is superseded — the same position as `OutcomeWrite::AlreadyFinished` below, one
-        // level down. The conflict is a fact about ownership, not a failure of the workflow, so
-        // the caller gets the outcome the winner records rather than an error for a workflow
-        // that may well succeed.
-        Err(Failure::Control(Error::SystemDatabase(
-            crate::sysdb::Error::StepAlreadyRecorded {
-                workflow_id: conflicted,
-                step_id,
-            },
-        ))) if conflicted == workflow_id => {
+        // A write was refused because the workflow was handed to another execution (cancelled,
+        // resumed, or recovered), so this one is superseded: the same position as
+        // `OutcomeWrite::AlreadyFinished` below, one level down. It is a fact about ownership,
+        // not a failure of the workflow, so the caller gets the outcome the owner records rather
+        // than an error for a workflow that may well succeed.
+        Err(Failure::Control(Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
+            workflow_id: conflicted,
+        }))) if conflicted == workflow_id => {
             tracing::warn!(
                 workflow_id,
-                step_id,
-                "another execution recorded this workflow's step first; waiting for its outcome"
+                "the workflow is no longer owned by this execution; waiting for the owner's outcome"
             );
             return adopt_superseded(executor, workflow_id, slot).await;
         }
@@ -2115,7 +2131,7 @@ async fn execute(
         Err(Failure::Recorded(recorded)) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded))
+                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded), &owner_xid)
                 .await
         }
     }
@@ -2438,6 +2454,7 @@ mod tests {
             Ctx::new(
                 Arc::clone(&executor),
                 "wf-donor",
+                crate::context::TEST_OWNER,
                 None,
                 crate::serialization::PayloadEncoding::Native,
             ),
@@ -2449,6 +2466,7 @@ mod tests {
         let thief = Ctx::new(
             Arc::clone(&executor),
             "wf-thief",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );

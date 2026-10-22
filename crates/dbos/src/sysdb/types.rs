@@ -1188,10 +1188,9 @@ pub enum AwaitedOutcome {
     Cancelled,
     /// It was recovered too many times and parked, so it has neither.
     ///
-    /// The limit it exceeded is not stored — `max_recovery_attempts` is an input to
-    /// [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) rather than a column — so
-    /// the count is what can be reported. Go reports `attempts - 2` as the limit, which is an
-    /// approximation of the same missing number.
+    /// The limit it exceeded is not stored — it is the engine's, applied when a dequeue dispatches
+    /// the workflow, rather than a column — so the count is what can be reported. Go reports
+    /// `attempts - 2` as the limit, which is an approximation of the same missing number.
     Parked {
         /// Recovery attempts recorded against the workflow.
         recovery_attempts: i64,
@@ -1210,18 +1209,18 @@ pub struct StepTiming {
     ///
     /// Fixed before the write and **it must not move between retries of the same logical
     /// record**. On a duplicate insert the stored value is compared against this one: equal means
-    /// this caller's own write whose acknowledgement was lost, different means another execution
-    /// recorded the step first. Re-stamping the clock per attempt would turn every lost
-    /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
-    /// than building it at the call site inside a retry loop.
+    /// this caller's own write whose acknowledgement was lost, different means this execution
+    /// recorded the step already, which is nondeterminism. Re-stamping the clock per attempt
+    /// would turn every lost acknowledgement into a spurious conflict — so hold the `StepTiming`
+    /// in a variable rather than building it at the call site inside a retry loop.
     ///
     /// **A step whose every attempt checks for it before writing is the exception**, and the
     /// internal step runners are the ones that do: a record acknowledged to nobody — a success
     /// committed with the work, or a failure recorded after the work rolled back — is caught by
-    /// the check on the next attempt and replayed, so it never reaches the insert. Only a genuine
-    /// rival survives to be compared there, and a completion that differs from this attempt's is
-    /// the right answer rather than a spurious one — which is why those paths stamp the clock
-    /// after their work rather than before it.
+    /// the check on the next attempt and replayed, so it never reaches the insert. Nothing that
+    /// reaches the comparison there is a lost acknowledgement, so a completion that differs from
+    /// this attempt's is the right answer rather than a spurious one — which is why those paths
+    /// stamp the clock after their work rather than before it.
     ///
     /// Omitting the timing altogether gives up that detection: with no recorded completion there
     /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
@@ -1290,7 +1289,8 @@ impl WorkflowDelay {
 pub enum OutcomeWrite {
     /// This process recorded the outcome.
     Recorded,
-    /// Another process got there first, and the row is already terminal.
+    /// Another execution got there first, and the row is already terminal, or this execution no
+    /// longer owns the workflow.
     ///
     /// Not an error: the caller has lost a race it was allowed to lose, and should adopt the
     /// recorded outcome rather than overwrite it.
@@ -1350,18 +1350,17 @@ pub struct WorkflowInitResult {
     /// May differ from what the caller offered: the first writer decides the format, and every
     /// later attempt has to read the payloads that are actually there.
     pub serialization: Option<String>,
-    /// The input the row already held, where a fresh start is to run a row it did not create — one
-    /// no attempt owns: `Some(None)` for a row with no input, and `None` otherwise.
+    /// Whether this caller should go on to run the workflow: whether it created the row, by this
+    /// call or by an earlier attempt of it whose acknowledgement was lost.
     ///
-    /// Only the attempt that creates a row writes its input, so a fresh start that runs an existing
-    /// one offered an input the row does not hold. The row is what a recovery runs, so the run has
-    /// to start from this, not from what the caller offered.
-    pub existing_input: Option<Option<String>>,
-    /// Whether this caller should go on to run the workflow.
-    ///
-    /// `false` means another owner holds it, so the row is recorded, but running it would be a
-    /// second execution.
+    /// `false` means another caller created it, so the row is recorded but running it would be a
+    /// second execution. The caller joins it instead, whatever has become of the row.
     pub should_execute: bool,
+    /// This call's creator token, which the row holds as `creator_xid` when `should_execute`.
+    ///
+    /// A row inserted `PENDING` is owned by its creator from the start, so this is also the
+    /// `owner_xid` the execution that runs it holds, and presents on every write it makes.
+    pub creator_xid: String,
 }
 
 /// Whether a name is usable as an application name.
@@ -2097,6 +2096,7 @@ pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
         workflow_id,
         step_id,
         codec,
+        ..
     } = caller;
     codec
         .decode(recorded, step.serialization.as_deref())
@@ -2122,6 +2122,22 @@ pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
         })
 }
 
+/// The execution a write is made by: the workflow it runs, and the token it owns it by.
+///
+/// A write that carries one lands only while the workflow's row still holds that token, checked
+/// in the write's own transaction before anything else and locking the row until it commits. Once
+/// the workflow has been handed to another execution (a cancel, a resume, a recovery), the write
+/// is refused with [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict) and rolls back.
+/// `None` where a method takes an `Option<WorkflowOwner>` is a caller that is not an execution, a
+/// client say, and is not checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowOwner<'a> {
+    /// The workflow the execution runs.
+    pub workflow_id: &'a str,
+    /// The token it owns the workflow by.
+    pub owner_xid: &'a str,
+}
+
 /// The workflow step a management call runs as, and how its result is recorded.
 ///
 /// What the methods that record their own result take, where the plain-id methods take `caller:
@@ -2138,6 +2154,19 @@ pub struct StepCaller<'a> {
     pub step_id: i32,
     /// How the recorded result is encoded and decoded.
     pub codec: &'a dyn StepCodec,
+    /// The token the calling execution owns its workflow by: the call and its record land only
+    /// while the workflow is still that execution's.
+    pub owner_xid: &'a str,
+}
+
+impl<'a> StepCaller<'a> {
+    /// The execution making the call, which the call is checked against.
+    pub fn owner(&self) -> WorkflowOwner<'a> {
+        WorkflowOwner {
+            workflow_id: self.workflow_id,
+            owner_xid: self.owner_xid,
+        }
+    }
 }
 
 /// The workflow a [`get_event`](crate::sysdb::SystemDatabase::get_event) runs on behalf of, and the
@@ -2169,6 +2198,8 @@ pub struct GetEventCaller<'a> {
     /// start the timeout again — a read that waited fifty of its sixty seconds and crashed has ten
     /// left.
     pub timeout_step_id: i32,
+    /// The token the reading execution owns its workflow by, which both records present.
+    pub owner_xid: &'a str,
 }
 
 /// The workflow an [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) creates a child
@@ -2207,6 +2238,9 @@ pub struct InitWorkflowCaller<'a> {
     /// When the start began, for the row's `started_at`. The completion is stamped by the write
     /// itself, since the step spans the launch alone.
     pub started_at: Timestamp,
+    /// The token the parent's execution owns it by. The child is created, and the start
+    /// recorded, only while the parent is still that execution's: a stale parent starts nothing.
+    pub owner_xid: &'a str,
 }
 
 /// An encoded payload and the format it is encoded in.

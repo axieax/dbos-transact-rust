@@ -537,6 +537,7 @@ where
                     Outcome::Output(Some(&output)),
                     serialization,
                     timing,
+                    ctx.owner_xid(),
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
@@ -563,6 +564,7 @@ where
                     Outcome::Error(&encoded),
                     serialization,
                     timing,
+                    ctx.owner_xid(),
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
@@ -829,9 +831,10 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, None)
+            .init_workflow(&NewWorkflow::new(id), None)
             .await
             .expect("could not create the workflow row");
+        crate::context::own_for_test(&db, id).await;
         (dbos, db)
     }
 
@@ -839,6 +842,7 @@ mod tests {
         Ctx::new(
             dbos.executor("test").expect("launched"),
             id,
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         )
@@ -992,6 +996,7 @@ mod tests {
                 Outcome::Error(r#"{"pythonModule":"app.errors","type":"CardDeclined"}"#),
                 Some("rust_serde"),
                 None,
+                crate::context::TEST_OWNER,
             )
             .await
             .expect("could not record the step");
@@ -1351,7 +1356,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new("wf-thief"), None, None)
+            .init_workflow(&NewWorkflow::new("wf-thief"), None)
             .await
             .expect("could not create the second workflow row");
 

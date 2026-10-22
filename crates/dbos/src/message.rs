@@ -68,7 +68,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepPlacement};
+use crate::checkpoint::{Built, PendingStep, StepPlacement, StepPosition, StepWriter};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
@@ -269,12 +269,24 @@ where
             // `recv` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — `sysdb::recv` takes a required caller for the same reason, there
             // being no uncheckpointed form of a call that consumes.
-            let Some((workflow_id, step_id)) = placement.step() else {
+            let Some(StepWriter {
+                workflow_id,
+                step_id,
+                owner_xid,
+            }) = placement.step_writer()
+            else {
                 unreachable!("recv is refused outside a workflow and inside a step")
             };
             let found = executor
                 .sysdb()
-                .recv(workflow_id, step_id, timeout_step_id, topic, timeout)
+                .recv(
+                    workflow_id,
+                    step_id,
+                    timeout_step_id,
+                    topic,
+                    timeout,
+                    owner_xid,
+                )
                 .await
                 .map_err(Error::SystemDatabase)?;
             match found {
@@ -502,8 +514,9 @@ fn pending_send<'a, E: DurableError + 'a>(
             conn.send_encoded(
                 &encoded.as_message(),
                 &encoded.encoding,
-                placement.step(),
+                placement.step_position(),
                 forks,
+                placement.owner(),
             )
             .await
             .map_err(Error::lift)
@@ -528,9 +541,15 @@ fn pending_send_bulk<'a, E: DurableError + 'a>(
                 .unwrap_or_default();
             let messages: Vec<EncodedMessage<'_>> =
                 encoded.iter().map(Encoded::as_message).collect();
-            conn.send_all_encoded(&messages, &encoding, placement.step(), forks)
-                .await
-                .map_err(Error::lift)
+            conn.send_all_encoded(
+                &messages,
+                &encoding,
+                placement.step_position(),
+                forks,
+                placement.owner(),
+            )
+            .await
+            .map_err(Error::lift)
         },
     )
 }
@@ -557,8 +576,9 @@ impl Connection {
         &self,
         message: &EncodedMessage<'_>,
         encoding: &PayloadEncoding,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepPosition<'_>>,
         forks: Forks,
+        owner: Option<crate::sysdb::types::WorkflowOwner<'_>>,
     ) -> Result<(), E>
     where
         E: DurableError,
@@ -567,8 +587,9 @@ impl Connection {
             .send_message(
                 message,
                 Some(encoding.name()),
-                caller,
+                caller.map(|at| (at.workflow_id, at.step_id)),
                 forks == Forks::Include,
+                owner,
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -584,8 +605,9 @@ impl Connection {
         &self,
         messages: &[EncodedMessage<'_>],
         encoding: &PayloadEncoding,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepPosition<'_>>,
         forks: Forks,
+        owner: Option<crate::sysdb::types::WorkflowOwner<'_>>,
     ) -> Result<(), E>
     where
         E: DurableError,
@@ -594,8 +616,9 @@ impl Connection {
             .send_messages(
                 messages,
                 Some(encoding.name()),
-                caller,
+                caller.map(|at| (at.workflow_id, at.step_id)),
                 forks == Forks::Include,
+                owner,
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -648,6 +671,7 @@ impl crate::Client {
                 &encoded.encoding,
                 None,
                 options.forks,
+                None,
             )
             .await
     }
@@ -691,7 +715,7 @@ impl crate::Client {
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
         self.connection()
-            .send_all_encoded(&messages, &encoding, None, options.forks)
+            .send_all_encoded(&messages, &encoding, None, options.forks, None)
             .await
     }
 }
