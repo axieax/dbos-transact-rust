@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::error::{DurableError, Error};
-use crate::sysdb::types::{Timestamp, step_names};
+use crate::sysdb::types::{StepCaller, Timestamp, duration_to_ms, step_names};
 
 /// Waits for `duration`, resuming at the **original** wake time after a crash.
 ///
@@ -38,6 +38,17 @@ use crate::sysdb::types::{Timestamp, step_names};
 ///
 /// A zero or negative duration is not an error: it records the checkpoint and returns, so a
 /// computed delay that has already elapsed behaves the same on the first run and on a replay.
+///
+/// **A duration too long to record is [`Error::InvalidArgument`]**: one that does not fit in
+/// milliseconds as a 64-bit integer. Refused at the call, before the step id is taken, so a refused
+/// sleep moves no counter — and refused outside a workflow too, so the same call does not succeed
+/// or fail depending on where it is written.
+///
+/// A duration that fits but carries the wake time past the largest instant those milliseconds can
+/// hold is refused by the checkpoint instead, after the step id is taken, as the same
+/// [`Error::InvalidArgument`]. That rule reads the clock, so it is applied only where the record
+/// has been looked for first, and the refusal is recorded like a wake time: a replay gets back
+/// what the first run recorded, either one, rather than deciding again against a later clock.
 pub fn sleep<E>(duration: Duration) -> PendingStep<'static, (), E>
 where
     E: DurableError + 'static,
@@ -50,8 +61,16 @@ where
     // The executor comes off the placement rather than from a second read of the ambient context,
     // so the two cannot disagree about whether there is one: that is the invariant the run below
     // leans on when it asks for an executor and an id together.
-    let placement = StepPlacement::here();
-    let built = Ok((placement.executor().map(Arc::clone), placement));
+    //
+    // The duration is checked first, so a refusal claims no id — and only against a rule that
+    // reads no clock, so the first run and a replay decide it the same way.
+    let built = match duration_to_ms("duration", duration) {
+        Err(error) => Err(Error::refused_argument("sleep", error)),
+        Ok(_) => {
+            let placement = StepPlacement::here();
+            Ok((placement.executor().map(Arc::clone), placement))
+        }
+    };
     PendingStep::placed(
         step_names::SLEEP,
         built,
@@ -78,9 +97,17 @@ where
 
             let wake_at = executor
                 .sysdb()
-                .record_sleep(workflow_id, step_id, duration, owner_xid)
+                .record_sleep(
+                    StepCaller {
+                        workflow_id,
+                        step_id,
+                        codec: executor.serializer(),
+                        owner_xid,
+                    },
+                    duration,
+                )
                 .await
-                .map_err(Error::SystemDatabase)?;
+                .map_err(|error| Error::refused_argument("sleep", error))?;
 
             // From the recorded wake time, not from now: on a replay `record_sleep` gives back the
             // instant the first run chose, and the remaining wait is whatever is left of it. A
@@ -95,4 +122,25 @@ where
             Ok(())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Outside a workflow too, so the same call does not succeed in one place and fail in another.
+    #[tokio::test]
+    async fn a_sleep_that_cannot_be_recorded_is_refused_outside_a_workflow() {
+        let refused = sleep::<crate::error::EngineOnly>(Duration::MAX).await;
+        match refused {
+            Err(Error::InvalidArgument { operation, detail }) => {
+                assert_eq!(operation, "sleep");
+                assert_eq!(
+                    detail,
+                    "`duration` must fit in milliseconds as a 64-bit integer"
+                );
+            }
+            other => panic!("expected the sleep to be refused, got {other:?}"),
+        }
+    }
 }

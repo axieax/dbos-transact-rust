@@ -122,6 +122,24 @@ impl Timestamp {
             .map(Self)
     }
 
+    /// This instant plus a duration the caller supplied, or [`Error::InvalidInput`] naming
+    /// `field` when the sum cannot be stored.
+    ///
+    /// [`checked_add`](Self::checked_add) for a value that is about to be written: a duration too
+    /// long for [`duration_to_ms`], or one that carries the instant past `i64::MAX` milliseconds,
+    /// is the caller's to hear about rather than a wrapped instant in a column.
+    pub fn try_add(self, field: &'static str, duration: Duration) -> Result<Self, Error> {
+        let ms = duration_to_ms(field, duration)?;
+        self.0
+            .checked_add(ms)
+            .map(Self)
+            .ok_or_else(|| Error::InvalidInput {
+                field: field.into(),
+                detail: "must not end past the latest instant 64-bit epoch milliseconds can hold"
+                    .to_owned(),
+            })
+    }
+
     /// How long after `earlier` this instant is, or `None` if it is not after it.
     pub fn duration_since(self, earlier: Self) -> Option<Duration> {
         self.0
@@ -196,6 +214,46 @@ pub fn duration_from_ms(ms: i64) -> Option<Duration> {
 /// it; `try_from_secs_f64` covers all four.
 pub fn duration_from_secs(secs: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(secs).ok()
+}
+
+/// Rejects a workflow or fork's delay or timeout that is zero, or too long to store as
+/// milliseconds, as [`Error::InvalidInput`] naming `field`.
+///
+/// The rule [`NewWorkflow::validate`] and [`ForkOptions::validate`] apply, kept in one place so
+/// the surfaces that start a workflow can refuse the same values before they take a step id. A
+/// zero delay is a caller that meant `None`, and a zero timeout would expire the workflow before
+/// it ran. Both are written as milliseconds: the timeout as itself, the delay as an instant
+/// resolved from it, so one that does not fit is refused rather than truncated into the column.
+///
+/// Neither rule reads a clock, so a surface can apply them before a step id is taken without a
+/// replay deciding differently from the first run.
+pub(crate) fn validate_positive_duration(
+    field: &'static str,
+    duration: Duration,
+) -> Result<(), Error> {
+    if duration.is_zero() {
+        return Err(Error::InvalidInput {
+            field: field.into(),
+            detail: "must be a positive, non-zero duration".to_owned(),
+        });
+    }
+    duration_to_ms(field, duration)?;
+    Ok(())
+}
+
+/// Converts a caller's duration to the integer milliseconds a column such as
+/// `workflow_timeout_ms` stores, or [`Error::InvalidInput`] naming `field` when it does not fit.
+///
+/// The inverse of [`duration_from_ms`], for the write side. `Duration::as_millis` is a `u128`, and
+/// narrowing it with `as` would store a truncated, possibly negative, value in place of the one
+/// the caller gave. Reported rather than saturated, for the reason stated on
+/// [`Timestamp::to_system_time`]: a value this layer cannot store is the caller's to hear about,
+/// not one to quietly replace with a different one.
+pub fn duration_to_ms(field: &'static str, duration: Duration) -> Result<i64, Error> {
+    i64::try_from(duration.as_millis()).map_err(|_| Error::InvalidInput {
+        field: field.into(),
+        detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
+    })
 }
 
 /// Where a workflow is in its lifecycle.
@@ -611,15 +669,11 @@ impl<'a> NewWorkflow<'a> {
                 });
             }
         }
-        // Java rejects a zero or negative duration outright; `Duration` already rules out
-        // negatives, so only zero is left to catch. A zero delay is a caller that meant `None`,
-        // and a zero timeout would expire the workflow before it ran.
+        // `Duration` already rules out negatives, so zero and a value too long to store are what
+        // is left; `validate_positive_duration` says why each is refused.
         for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
-            if value == Some(Duration::ZERO) {
-                return Err(Error::InvalidInput {
-                    field: field.into(),
-                    detail: "must be a positive, non-zero duration".to_owned(),
-                });
+            if let Some(value) = value {
+                validate_positive_duration(field, value)?;
             }
         }
         validate_attributes(self.attributes)?;
@@ -784,6 +838,116 @@ mod tests {
         // Finite and non-negative, and still not a duration: an `is_finite()` guard alone lets it
         // through to a panic, and the columns it reads are wide enough to hold it.
         assert_eq!(duration_from_secs(1e300), None);
+    }
+
+    /// A duration converts while its milliseconds fit an `i64`, and is refused one past that.
+    #[test]
+    fn a_duration_converts_to_milliseconds_only_while_it_fits() {
+        let largest = Duration::from_millis(i64::MAX as u64);
+        assert_eq!(duration_to_ms("timeout", largest).unwrap(), i64::MAX);
+        assert_eq!(duration_to_ms("timeout", Duration::ZERO).unwrap(), 0);
+        // Sub-millisecond precision is dropped, as the column cannot hold it, and is not what
+        // pushes a value over.
+        let largest_with_spare_nanos = largest + Duration::from_nanos(999_999);
+        assert_eq!(
+            duration_to_ms("timeout", largest_with_spare_nanos).unwrap(),
+            i64::MAX
+        );
+
+        for refused in [largest + Duration::from_millis(1), Duration::MAX] {
+            match duration_to_ms("timeout", refused) {
+                Err(Error::InvalidInput { field, detail }) => {
+                    assert_eq!(field, "timeout");
+                    assert_eq!(detail, "must fit in milliseconds as a 64-bit integer");
+                }
+                other => panic!("{refused:?} should have been refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// An instant plus a caller's duration is refused, not wrapped, past the largest instant.
+    #[test]
+    fn an_instant_past_the_largest_is_refused_not_wrapped() {
+        let start = Timestamp::from_epoch_ms(1_700_000_000_000);
+        assert_eq!(
+            start.try_add("delay", Duration::from_secs(1)).unwrap(),
+            Timestamp::from_epoch_ms(1_700_000_001_000)
+        );
+        let room = Duration::from_millis((i64::MAX - start.as_epoch_ms()) as u64);
+        assert_eq!(
+            start.try_add("delay", room).unwrap(),
+            Timestamp::from_epoch_ms(i64::MAX)
+        );
+
+        // Fits in milliseconds on its own, and still overflows the sum.
+        let over = room + Duration::from_millis(1);
+        assert!(matches!(
+            start.try_add("delay", over),
+            Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+        ));
+        // Does not fit at all.
+        assert!(matches!(
+            start.try_add("duration", Duration::MAX),
+            Err(Error::InvalidInput { ref field, .. }) if field == "duration"
+        ));
+    }
+
+    /// A relative delay resolves against `now`, and one that cannot be stored is reported.
+    #[test]
+    fn a_relative_delay_that_cannot_be_stored_does_not_resolve() {
+        let now = Timestamp::from_epoch_ms(1_700_000_000_000);
+        assert_eq!(
+            WorkflowDelay::For(Duration::from_secs(60))
+                .resolve(now)
+                .unwrap(),
+            Timestamp::from_epoch_ms(1_700_000_060_000)
+        );
+        // An absolute instant is taken as given, whatever `now` is.
+        let until = Timestamp::from_epoch_ms(i64::MAX);
+        assert_eq!(WorkflowDelay::Until(until).resolve(now).unwrap(), until);
+
+        for refused in [
+            Duration::MAX,
+            Duration::from_millis((i64::MAX - now.as_epoch_ms()) as u64 + 1),
+        ] {
+            assert!(
+                matches!(
+                    WorkflowDelay::For(refused).resolve(now),
+                    Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+                ),
+                "{refused:?} should not resolve"
+            );
+        }
+    }
+
+    /// A workflow's timeout and delay are refused by validation when they cannot be stored, so
+    /// the refusal comes before anything is written.
+    #[test]
+    fn an_oversized_workflow_timeout_or_delay_does_not_validate() {
+        let fits = NewWorkflow {
+            delay: Some(Duration::from_millis(i64::MAX as u64)),
+            timeout: Some(Duration::from_millis(i64::MAX as u64)),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(fits.validate().is_ok());
+
+        let timeout = NewWorkflow {
+            timeout: Some(Duration::MAX),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(matches!(
+            timeout.validate(),
+            Err(Error::InvalidInput { ref field, .. }) if field == "timeout"
+        ));
+        let delay = NewWorkflow {
+            queue_name: Some("q"),
+            delay: Some(Duration::MAX),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(matches!(
+            delay.validate(),
+            Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+        ));
     }
 
     /// Both readers accept zero, and for the same reason.
@@ -1274,12 +1438,15 @@ pub enum WorkflowDelay {
 
 impl WorkflowDelay {
     /// The instant this delay expires, resolved against `now` if it is relative.
-    pub(crate) fn resolve(self, now: Timestamp) -> Timestamp {
+    ///
+    /// [`Error::InvalidInput`] for a relative delay whose instant cannot be stored. Fallible
+    /// rather than left to a validation upstream, because no check made without `now` can rule
+    /// that out: a delay that fits in milliseconds can still carry `now` past `i64::MAX`, and
+    /// only the resolution knows which `now` it is.
+    pub(crate) fn resolve(self, now: Timestamp) -> Result<Timestamp, Error> {
         match self {
-            WorkflowDelay::For(d) => {
-                Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64)
-            }
-            WorkflowDelay::Until(t) => t,
+            WorkflowDelay::For(d) => now.try_add("delay", d),
+            WorkflowDelay::Until(t) => Ok(t),
         }
     }
 }
@@ -2467,13 +2634,9 @@ impl ForkOptions<'_> {
             }
         }
         // As on `NewWorkflow`: a zero timeout would expire the fork before it ran.
-        if self.timeout == Some(Duration::ZERO) {
-            return Err(Error::InvalidInput {
-                field: "timeout".into(),
-                detail: "must be absent rather than zero".to_owned(),
-            });
+        if let Some(timeout) = self.timeout {
+            validate_positive_duration("timeout", timeout)?;
         }
-        self.timeout_ms()?;
         // The replacements are applied by joining against them, so one child named twice would
         // match a copied step twice and duplicate it. The primary key would catch that as a
         // constraint violation, which says nothing about the map that caused it. Python and
@@ -2509,18 +2672,12 @@ impl ForkOptions<'_> {
 
     /// The timeout in milliseconds, the unit its column stores.
     ///
-    /// Refused rather than saturated, following `Timestamp::checked_add` and the rule stated on
-    /// `to_system_time`: a value this layer cannot store is the caller's to hear about, not one to
-    /// quietly replace with a different timeout. [`validate`](Self::validate) is where a caller
-    /// hears it; the insert converts through here too, so the rule is written once.
+    /// Refused rather than saturated, by [`duration_to_ms`]. [`validate`](Self::validate) is where
+    /// a caller hears it, through [`validate_positive_duration`]; the insert converts through here,
+    /// so the unit is written once.
     pub(crate) fn timeout_ms(&self) -> Result<Option<i64>, Error> {
         self.timeout
-            .map(|timeout| {
-                i64::try_from(timeout.as_millis()).map_err(|_| Error::InvalidInput {
-                    field: "timeout".into(),
-                    detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
-                })
-            })
+            .map(|timeout| duration_to_ms("timeout", timeout))
             .transpose()
     }
 }

@@ -15,7 +15,7 @@ use tracing::Instrument;
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::error::{DurableError, EncodedError, Error, Failure, Result};
+use crate::error::{DurableError, EncodedError, Error, Failure, Result, refusal_detail};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
@@ -23,6 +23,7 @@ use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, 
 use crate::sysdb::types::{
     AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
     StepCaller, StepTiming, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
+    validate_positive_duration,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -494,16 +495,18 @@ impl<'a> Enqueue<'a> {
     ///   accepting it would give that state a second spelling that reads like a real priority;
     ///   the references' documented range starts at 1 for the same reason. The ceiling is
     ///   [`i32::MAX`] because the column is a signed 32-bit integer.
+    /// - **A delay must be more than zero, and fit in milliseconds as a 64-bit integer.** A zero
+    ///   delay is a caller that meant `None`. Neither rule reads a clock, so a replay decides it as
+    ///   the first run did. A delay that fits but carries `now` past the largest instant is refused
+    ///   by the system database when it resolves the delay, which also refuses everything here
+    ///   again for its own callers.
     ///
     /// Naming the queue in the message rather than only the field, because a start that fails
     /// validation says nothing else about which enqueue it was.
     pub(crate) fn validate(&self) -> Result<()> {
-        let refuse = |message: String| {
-            Err(Error::Config(format!(
-                "enqueue onto `{}`: {message}",
-                self.name
-            )))
-        };
+        let refused =
+            |message: String| Error::Config(format!("enqueue onto `{}`: {message}", self.name));
+        let refuse = |message: String| Err(refused(message));
 
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
             && self.deduplication_id.is_none()
@@ -528,6 +531,13 @@ impl<'a> Enqueue<'a> {
                 ));
             }
         }
+        if let Some(delay) = self.delay {
+            validate_positive_duration("delay", delay).map_err(|error| {
+                Error::from_refusal(error, |field, detail| {
+                    refused(refusal_detail(field, &detail))
+                })
+            })?;
+        }
         Ok(())
     }
 
@@ -538,6 +548,31 @@ impl<'a> Enqueue<'a> {
     pub(crate) fn stored_priority(&self) -> i32 {
         self.priority.map_or(0, |priority| priority as i32)
     }
+}
+
+/// Refuses a start's arguments that no row could hold: its enqueue's, through
+/// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds.
+///
+/// The one check every surface that starts or enqueues a workflow makes before it writes
+/// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
+/// before they encode the input — so a refusal costs no row and no step id. None of it reads a
+/// clock, so a replay decides it as the first run did. The system database refuses the same
+/// values again for its own callers.
+pub(crate) fn validate_start(
+    enqueue: Option<&Enqueue<'_>>,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    if let Some(enqueue) = enqueue {
+        enqueue.validate()?;
+    }
+    if let Some(timeout) = timeout {
+        validate_positive_duration("timeout", timeout).map_err(|error| {
+            Error::from_refusal(error, |field, detail| {
+                Error::Config(refusal_detail(field, &detail))
+            })
+        })?;
+    }
+    Ok(())
 }
 
 /// A new workflow row with its queue-shaped half filled in: the five columns an [`Enqueue`]
@@ -894,8 +929,8 @@ where
     /// reproduce it — so the half of a start that decides *where* it stands has to be a plain
     /// function, and only the half that writes rows may be deferred into the future.
     ///
-    /// **The two checks ahead of the placement are ahead of it on purpose**: a start refused for
-    /// its instance or its enqueue must move no counter, or the refusal shifts every later step
+    /// **The checks ahead of the placement are ahead of it on purpose**: a start refused for its
+    /// instance, its enqueue or its timeout must move no counter, or the refusal shifts every later step
     /// of the parent onto the wrong replay slot. `queue::validate` refuses a queue's own
     /// configuration in the same spot, for the same reason it costs a round trip and not a row.
     ///
@@ -918,9 +953,7 @@ where
         // Borrowed rather than moved, because `options` is read again by the run, and **validated
         // before anything is written and before the counter moves**: an enqueue no queue could
         // honour should cost a round trip, not a row and not a step id.
-        if let Some(enqueue) = options.queue.as_ref() {
-            enqueue.validate()?;
-        }
+        validate_start(options.queue.as_ref(), options.timeout.budget())?;
         let placement = StepPlacement::of(executor.connection(), "starting a workflow")?;
         if matches!(placement, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
@@ -1631,6 +1664,14 @@ impl StartPlacement {
 ///   workflow of another function, class or config, and once that row is deleted the same start
 ///   would go ahead.
 ///
+/// One more depends on the clock rather than on another row:
+///
+/// - [`InvalidInput`](crate::sysdb::Error::InvalidInput): a delay that fits in milliseconds but
+///   carries the release time past the largest instant a row can hold. Whether it does depends on
+///   when the start runs, so a replay on a host whose clock is behind could go ahead with it. The
+///   other `InvalidInput`s a start can reach depend only on its arguments, and recording one of
+///   those changes nothing, since the replay would refuse it the same way.
+///
 /// Without the record, the replay would start the child and the parent would take the other branch
 /// from the one it took after the error. Every other error a start can return is one of:
 ///
@@ -1650,6 +1691,7 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
         error,
         crate::sysdb::Error::QueueDeduplicated { .. }
             | crate::sysdb::Error::ConflictingWorkflow { .. }
+            | crate::sysdb::Error::InvalidInput { .. }
     )
 }
 
@@ -1659,7 +1701,8 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
 /// name, so [`check_child`](Parent::check_child) can tell a recorded start error from a plain
 /// step's error by that key, before reading it as the type. A unit test keeps this list and the
 /// predicate in step.
-const RECORDED_START_ERRORS: [&str; 2] = ["QueueDeduplicated", "ConflictingWorkflow"];
+const RECORDED_START_ERRORS: [&str; 3] =
+    ["QueueDeduplicated", "ConflictingWorkflow", "InvalidInput"];
 
 /// Whether `value`, a recorded step error, has the shape of a recorded start error.
 fn is_recorded_start_error(value: &serde_json::Value) -> bool {
@@ -2254,6 +2297,83 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A delay or a timeout the row cannot hold is refused with the start's other argument
+    /// checks, which run before the start takes a step id.
+    #[test]
+    fn a_start_refuses_a_delay_or_timeout_the_row_cannot_hold() {
+        let fits = Duration::from_secs(3600);
+        assert!(
+            Enqueue {
+                delay: Some(fits),
+                ..Enqueue::new("q")
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(validate_start(None, Some(fits)).is_ok());
+        assert!(validate_start(None, None).is_ok());
+
+        let delay = Enqueue {
+            delay: Some(Duration::MAX),
+            ..Enqueue::new("q")
+        }
+        .validate();
+        assert!(
+            matches!(&delay, Err(Error::Config(message))
+                if message == "enqueue onto `q`: `delay` must fit in milliseconds as a 64-bit integer"),
+            "got {delay:?}"
+        );
+        // Fits in milliseconds, and would carry now past the largest instant. That rule reads the
+        // clock, so it is not this check's: the system database applies it when it resolves the
+        // delay.
+        assert!(
+            Enqueue {
+                delay: Some(Duration::from_millis(i64::MAX as u64)),
+                ..Enqueue::new("q")
+            }
+            .validate()
+            .is_ok()
+        );
+        // The enqueue's own checks run through the same function.
+        let both = validate_start(
+            Some(&Enqueue {
+                delay: Some(Duration::ZERO),
+                ..Enqueue::new("q")
+            }),
+            Some(fits),
+        );
+        assert!(
+            matches!(&both, Err(Error::Config(message)) if message.contains("`delay`")),
+            "got {both:?}"
+        );
+
+        let timeout = validate_start(None, Some(Duration::MAX));
+        assert!(
+            matches!(&timeout, Err(Error::Config(message))
+                if message == "`timeout` must fit in milliseconds as a 64-bit integer"),
+            "got {timeout:?}"
+        );
+
+        // Zero is refused here too, with the system database's own wording, rather than once the
+        // start has taken its step id.
+        let delay = Enqueue {
+            delay: Some(Duration::ZERO),
+            ..Enqueue::new("q")
+        }
+        .validate();
+        assert!(
+            matches!(&delay, Err(Error::Config(message))
+                if message == "enqueue onto `q`: `delay` must be a positive, non-zero duration"),
+            "got {delay:?}"
+        );
+        let timeout = validate_start(None, Some(Duration::ZERO));
+        assert!(
+            matches!(&timeout, Err(Error::Config(message))
+                if message == "`timeout` must be a positive, non-zero duration"),
+            "got {timeout:?}"
+        );
+    }
 
     /// The names [`check_child`](Parent::check_child) recognises a recorded start error by are the
     /// variants [`should_record_start_error`] records, and no others.

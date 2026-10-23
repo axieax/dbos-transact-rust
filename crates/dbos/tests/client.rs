@@ -56,6 +56,75 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
     PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default())
 }
 
+/// A client enqueue whose timeout or delay the row cannot hold is refused before it writes one.
+#[tokio::test]
+async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
+    let db = test_database().await;
+    let client = client("client-unstorable", &db).await;
+
+    let cases = [
+        (
+            "refused-timeout",
+            EnqueueOptions {
+                workflow_id: Some("refused-timeout"),
+                timeout: Some(Duration::MAX),
+                ..EnqueueOptions::new("work")
+            },
+            "`timeout`",
+        ),
+        (
+            "refused-delay",
+            EnqueueOptions {
+                workflow_id: Some("refused-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::MAX),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay`",
+        ),
+        (
+            "zero-timeout",
+            EnqueueOptions {
+                workflow_id: Some("zero-timeout"),
+                timeout: Some(Duration::ZERO),
+                ..EnqueueOptions::new("work")
+            },
+            "`timeout` must be a positive, non-zero duration",
+        ),
+        (
+            "zero-delay",
+            EnqueueOptions {
+                workflow_id: Some("zero-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::ZERO),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay` must be a positive, non-zero duration",
+        ),
+    ];
+    for (id, options, expected) in cases {
+        let refused = client
+            .enqueue_with::<_, (), EngineOnly>("never_registered", (), options)
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::Config(message)) if message.contains(expected)),
+            "{id}: expected a refusal mentioning {expected}, got {:?}",
+            refused.map(|_| ())
+        );
+        assert!(
+            reader(&db)
+                .await
+                .get_workflow(id)
+                .await
+                .expect("read failed")
+                .is_none(),
+            "{id}: a refused enqueue wrote a row"
+        );
+    }
+}
+
 /// The client hands work over and the application runs it — the whole point of the surface.
 ///
 /// Nothing about the enqueue mentions a function: the client names the workflow by string, and the
@@ -1400,6 +1469,19 @@ async fn a_client_lists_tags_and_delays_workflows() {
         .set_workflow_delay(id, dbos::WorkflowDelay::For(Duration::ZERO))
         .await
         .expect("delay failed");
+
+    // A delay whose release instant cannot be stored is refused by the system database, and
+    // reported as an argument refusal: too long to be milliseconds at all, or fitting but carrying
+    // the clock past the largest instant.
+    for delay in [Duration::MAX, Duration::from_millis(i64::MAX as u64)] {
+        let refused = client
+            .set_workflow_delay(id, dbos::WorkflowDelay::For(delay))
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail.contains("`delay`")),
+            "a delay of {delay:?} should be refused, got {refused:?}"
+        );
+    }
 
     client.close().await;
 }

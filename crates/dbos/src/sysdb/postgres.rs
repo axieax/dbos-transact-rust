@@ -88,11 +88,11 @@ use super::types::{
     ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
     NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
-    StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming,
+    StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
     WorkflowFilter, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value,
-    duration_from_ms, duration_from_secs, encode_step_value, is_valid_application_name,
-    validate_attributes,
+    duration_from_ms, duration_from_secs, duration_to_ms, encode_step_value,
+    is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -1838,11 +1838,14 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
 /// [`record_sleep`](SystemDatabase::record_sleep): a caller registering a deadline reaches for the
 /// blocking read, not for this. Nothing outside this module has both a reason to record a sleep and
 /// a reason to choose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SleepKind {
+#[derive(Debug, Clone, Copy)]
+enum SleepKind<'a> {
     /// A sleep the caller intends to wait out, stamped complete at the wake time — in the future
     /// when the row is written, so a timeline shows an hour's sleep as an hour.
-    Durable,
+    ///
+    /// Carries the caller's codec, which a wake time too far out to store is recorded in as the
+    /// step's error.
+    Durable(&'a dyn StepCodec),
     /// A deadline the caller registers and usually abandons early, stamped complete now.
     ///
     /// Projecting here would report a `get_event` that answered in 200ms under a 60s timeout as a
@@ -1853,10 +1856,11 @@ enum SleepKind {
 /// The encoding of the one value this layer writes and reads back on its own: a sleep's wake
 /// time.
 ///
-/// Distinct from the workflow's own format, and from the [`StepCodec`](super::types::StepCodec) a
-/// management call brings: the wake time is a plain number that
-/// [`record_sleep`](SystemDatabase::record_sleep) reads back itself, with no caller codec to hand,
-/// so it is stored legibly rather than in whatever the application chose.
+/// Distinct from the workflow's own format, and from the [`StepCodec`] a
+/// caller brings: the wake time is a plain number that
+/// [`record_sleep`](SystemDatabase::record_sleep) reads back itself, so it is stored legibly
+/// rather than in whatever the application chose. A sleep refused for a wake time too far out
+/// records the refusal in the caller's codec, as any step's error is.
 const PORTABLE_JSON: &str = "portable_json";
 
 /// How many times a stream write retries onto a fresh offset before giving up.
@@ -1891,6 +1895,37 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// against a `numeric` casts the column, which costs it its index — and the column this is
 /// compared against is the dequeue's own.
 const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
+
+/// [`NOW_MS_SQL`] plus `operand`, a `bigint` column or parameter of milliseconds, held within
+/// `bigint`'s range where the sum would leave it: the deadline a timeout gives a workflow.
+///
+/// **Saturating, because the operand is a stored value and one row must not stop a batch.** The
+/// timeout column is written by every client that can reach the table, not only through this
+/// layer's validation, so it can hold anything a `bigint` can. Plain `+` raises `bigint out of
+/// range` for a timeout within `now` of the maximum, and in a dequeue's claim that failure takes
+/// the whole batch with it: the statement rolls back, the row stays `ENQUEUED`, and the next poll
+/// claims it again and fails the same way, so nothing on the queue ever starts.
+///
+/// The maximum is the right answer as well as a safe one: a deadline too far out to store is one
+/// that never elapses, which is what such a timeout asked for, and the same answer a blocking
+/// read gives a deadline it cannot store. The minimum, for a negative timeout no valid writer
+/// produces, is a deadline already past, which is what a negative budget means.
+///
+/// The sum is taken in `numeric`, which cannot overflow, and clamped before narrowing back to
+/// `bigint`; `numeric` is an alias of `DECIMAL` on CockroachDB, so one expression serves both.
+///
+/// A NULL operand is passed through explicitly, because `LEAST` and `GREATEST` skip NULL
+/// arguments: without the `CASE`, no timeout would clamp to the minimum and read as a deadline
+/// already past.
+fn now_ms_plus_sql(operand: &str) -> String {
+    format!(
+        "CASE WHEN ({operand}) IS NULL THEN NULL \
+         ELSE LEAST(GREATEST({NOW_MS_SQL}::numeric + ({operand})::numeric, \
+         ({min})::numeric), ({max})::numeric)::bigint END",
+        min = i64::MIN,
+        max = i64::MAX,
+    )
+}
 
 /// What a timeout writes: a cancel's columns plus `owner_xid`, so no execution holds the row.
 fn timed_out_set_sql() -> String {
@@ -2193,6 +2228,36 @@ fn decode_wake_time(
                 "workflow {workflow_id} step {step_id} wake time {recorded:?} is not epoch milliseconds: {e}"
             ))
         })
+}
+
+/// What a recorded sleep answers a replay with: its wake time, or the refusal a first run recorded
+/// in its place.
+///
+/// Only a sleep records a refusal. A deadline too far out is held at the largest instant instead,
+/// so a deadline that finds an error at its position reads it as the wake time it lacks.
+fn replayed_sleep(
+    step: &StepRecord,
+    kind: SleepKind<'_>,
+    workflow_id: &str,
+    step_id: i32,
+    owner_xid: &str,
+) -> Result<Timestamp, Error> {
+    if let (SleepKind::Durable(codec), Some(recorded)) = (kind, step.error.as_deref()) {
+        let caller = StepCaller {
+            workflow_id,
+            step_id,
+            codec,
+            owner_xid,
+        };
+        return Err(decode_step_value(
+            step,
+            recorded,
+            caller,
+            step_names::SLEEP,
+            "an error",
+        )?);
+    }
+    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
 }
 
 fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
@@ -2670,15 +2735,33 @@ impl PostgresSystemDatabase {
         workflow_id: &str,
         step_id: i32,
         duration: Duration,
-        kind: SleepKind,
+        kind: SleepKind<'_>,
         owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         let pool = &self.pool;
         // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
         // the clock per attempt would push it further out each time.
         let started_at = Timestamp::now();
-        let wake_at =
-            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
+        // Computed before the retry, and so before any write.
+        //
+        // A sleep whose wake time cannot be stored is refused: the caller asked to be woken at an
+        // instant this layer cannot record, and recording a different one would wake it at the
+        // wrong time on every replay. A deadline is different, because it bounds a wait rather
+        // than being the wait: one too far out to store is one that never elapses, which is what
+        // the caller asked for, so it is held at the largest instant there is — the same answer
+        // `get_event` gives outside a workflow, where no deadline is recorded at all.
+        //
+        // **The refusal is held until the record has been looked for.** Whether the sum fits
+        // depends on the clock, so a replay must not decide it again: a sleep the first run
+        // recorded wakes at its recorded instant, or is refused as it was, whatever
+        // `now + duration` would be today.
+        let wake_at = match kind {
+            SleepKind::Durable(_) => started_at.try_add("duration", duration),
+            SleepKind::Deadline => Ok(started_at
+                .checked_add(duration)
+                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX))),
+        };
+        let wake_at = &wake_at;
 
         with_retry(&self.retry, "checkpoint_sleep", move || async move {
             // A transaction for the owner check, which locks the workflow's row until the record
@@ -2700,27 +2783,57 @@ impl PostgresSystemDatabase {
                 .await?
             {
                 tracing::debug!(workflow_id, step_id, "replaying sleep");
-                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
+                return replayed_sleep(&step, kind, workflow_id, step_id, owner_xid);
             }
             tracing::debug!(
                 workflow_id,
                 step_id,
-                duration_ms = duration.as_millis() as u64,
+                duration_ms = duration.as_millis(),
                 "running sleep"
             );
 
-            let recorded = wake_at.as_epoch_ms().to_string();
-            let timing = StepTiming {
-                started_at,
-                // A sleep is stamped complete at its wake time, which is in the future — so the
-                // step's recorded duration is the sleep. A deadline is stamped now, because the
-                // caller registering it usually returns long before it. Both are fixed outside the
-                // retry, since `completed_at` is also the token that recognises this caller's own
-                // write after a lost acknowledgement.
-                completed_at: match kind {
-                    SleepKind::Durable => wake_at,
-                    SleepKind::Deadline => started_at,
-                },
+            // Only a first run reaches here, so only a first run decides the refusal. It is
+            // recorded in the sleep's place, so a replay reads it back rather than deciding again
+            // against a later clock, which could let through the sleep this run refused.
+            let encoded: EncodedValue;
+            let (outcome, completed_at) = match (wake_at, kind) {
+                (Ok(wake_at), kind) => {
+                    encoded = EncodedValue {
+                        value: wake_at.as_epoch_ms().to_string(),
+                        serialization: Some(PORTABLE_JSON.to_owned()),
+                    };
+                    // A sleep is stamped complete at its wake time, which is in the future — so
+                    // the step's recorded duration is the sleep. A deadline is stamped now,
+                    // because the caller registering it usually returns long before it. Both are
+                    // fixed outside the retry, since `completed_at` is also the token that
+                    // recognises this caller's own write after a lost acknowledgement.
+                    let completed_at = match kind {
+                        SleepKind::Durable(_) => *wake_at,
+                        SleepKind::Deadline => started_at,
+                    };
+                    (Outcome::Output(Some(&encoded.value)), completed_at)
+                }
+                (Err(refusal), SleepKind::Durable(codec)) => {
+                    // A custom serializer may fail to encode the refusal. Then nothing is
+                    // recorded and the encoding failure is what the caller sees, so the position
+                    // is decided afresh next time rather than answered by a refusal nothing
+                    // recorded.
+                    encoded = encode_step_value(refusal, codec, "an error").inspect_err(
+                        |encode_error| {
+                            tracing::warn!(
+                                workflow_id,
+                                step_id,
+                                error = %refusal,
+                                encode_error = %encode_error,
+                                "the sleep was refused, but the refusal could not be encoded to \
+                                 record it"
+                            );
+                        },
+                    )?;
+                    (Outcome::Error(&encoded.value), started_at)
+                }
+                // A deadline too far out is held at the largest instant above, never refused.
+                (Err(refusal), SleepKind::Deadline) => return Err(refusal.clone()),
             };
             match self
                 .record_step_on(
@@ -2728,19 +2841,22 @@ impl PostgresSystemDatabase {
                     workflow_id,
                     step_id,
                     step_names::SLEEP,
-                    Outcome::Output(Some(&recorded)),
-                    Some(PORTABLE_JSON),
-                    Some(timing),
+                    outcome,
+                    encoded.serialization.as_deref(),
+                    Some(StepTiming {
+                        started_at,
+                        completed_at,
+                    }),
                     None,
                 )
                 .await
             {
                 Ok(()) => {
                     conn.commit().await?;
-                    Ok(wake_at)
+                    wake_at.clone()
                 }
-                // The sleep was recorded between our check and our write. Its wake time is the
-                // one every replay must agree on, so adopt it rather than returning ours.
+                // The sleep was recorded between our check and our write. Its answer is the one
+                // every replay must agree on, so adopt it rather than returning ours.
                 Err(Error::StepNondeterminism { .. }) => {
                     let step = self
                         .check_step_on(&mut conn, workflow_id, step_id, step_names::SLEEP)
@@ -2750,7 +2866,7 @@ impl PostgresSystemDatabase {
                                 "sleep reported as recorded but cannot be read back".to_owned(),
                             )
                         })?;
-                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
+                    replayed_sleep(&step, kind, workflow_id, step_id, owner_xid)
                 }
                 Err(e) => Err(e),
             }
@@ -3063,10 +3179,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // TODO(dbos-team): UPSTREAM item 22. The delay should resolve against the database clock,
         // read once outside the retry.
+        //
+        // `validate` has already refused a delay or a timeout too long to store as milliseconds,
+        // but a delay that fits can still carry `now` past the largest instant, which only the
+        // resolution can see. Both are settled here, before the retry and before any write.
         let now = Timestamp::now();
         let delay_until = workflow
             .delay
-            .map(|d| Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64));
+            .map(|d| WorkflowDelay::For(d).resolve(now))
+            .transpose()?;
+        let timeout_ms = workflow
+            .timeout
+            .map(|d| duration_to_ms("timeout", d))
+            .transpose()?;
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
@@ -3116,6 +3241,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // **The conflict arm changes nothing.** It exists so `RETURNING` reports the row
             // that was already there; whoever holds it keeps it, its attempt count and its
             // executor.
+            //
+            // The deadline saturates rather than overflowing; see `now_ms_plus_sql`. The cast
+            // fixes the parameter's type for the arithmetic on both backends.
+            let deadline_from_timeout = now_ms_plus_sql("$18::bigint");
             let row = sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {workflow_table} (workflow_uuid, status, \
                  name, class_name, config_name, \
@@ -3128,7 +3257,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                  debounce_deadline_epoch_ms, is_debounced, application_name, creator_xid) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
                  {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, \
-                 COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {NOW_MS_SQL} + $18 END), \
+                 COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {deadline_from_timeout} END), \
                  $20, CASE WHEN $2 = 'PENDING' THEN $21 END, $22, $23::jsonb, $24, $25, $26, \
                  $27, $21) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
@@ -3157,7 +3286,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.application_version)
             .bind(workflow.application_id)
             .bind(initial_attempts)
-            .bind(workflow.timeout.map(|d| d.as_millis() as i64))
+            .bind(timeout_ms)
             .bind(workflow.deadline.map(Timestamp::as_epoch_ms))
             // The child's own back-pointer, from the caller that is also recording the start:
             // one value, both rows, no way for them to name different parents.
@@ -3898,7 +4027,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // TODO(dbos-team): UPSTREAM item 22, as on `init_workflow`.
         let now = Timestamp::now();
-        let delay_until = delay.resolve(now).as_epoch_ms();
+        // An instant that cannot be stored is refused inside the step, not here: whether it fits
+        // depends on the clock, so a replay must read back what the first run recorded rather
+        // than decide again. The step records the refusal like any other failure.
+        let delay_until = delay.resolve(now).map(Timestamp::as_epoch_ms);
+        let delay_until = &delay_until;
         let workflow_table = workflow_table.as_str();
         let started_at = Timestamp::now();
 
@@ -3908,6 +4041,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::SET_WORKFLOW_DELAY,
                 started_at,
                 |mut conn| async move {
+                    // The step runs this only when nothing is recorded, so only a first run is
+                    // refused; a replay reads back the refusal it recorded.
+                    let delay_until = delay_until.clone()?;
                     // `status = 'DELAYED'` is the guard: a released workflow is running or
                     // queued, and pushing its delay out would not recall it.
                     sqlx::query(AssertSqlSafe(format!(
@@ -5292,17 +5428,15 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn record_sleep(
         &self,
-        workflow_id: &str,
-        step_id: i32,
+        caller: StepCaller<'_>,
         duration: Duration,
-        owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         self.checkpoint_sleep(
-            workflow_id,
-            step_id,
+            caller.workflow_id,
+            caller.step_id,
             duration,
-            SleepKind::Durable,
-            owner_xid,
+            SleepKind::Durable(caller.codec),
+            caller.owner_xid,
         )
         .await
     }
@@ -6440,6 +6574,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             let started: Vec<String> = if candidates.is_empty() {
                 Vec::new()
             } else {
+                // Saturating, so a stored timeout near the maximum cannot fail the whole batch;
+                // see `now_ms_plus_sql`.
+                let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
                 let flipped: HashSet<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $2, application_version = $3, \
@@ -6451,7 +6588,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
+                             THEN {deadline_from_timeout} \
                              ELSE workflow_deadline_epoch_ms \
                          END \
                      WHERE workflow_uuid = ANY($5::text[]) AND status = 'ENQUEUED' \
@@ -6729,6 +6866,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // Counts `recovery_attempts` for the reason the unpartitioned sweep gives, and
                 // both count because both are claims: TypeScript increments in each of its two
                 // as well.
+                //
+                // The deadline saturates, as in the unpartitioned claim; see `now_ms_plus_sql`.
+                let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
                 let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
@@ -6740,7 +6880,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
+                             THEN {deadline_from_timeout} \
                              ELSE workflow_deadline_epoch_ms \
                          END \
                      WHERE {claim_predicate} RETURNING workflow_uuid"

@@ -1499,6 +1499,22 @@ async fn an_incoherent_enqueue_is_refused() {
             },
             "`DuplicationPolicy::ReturnExisting` needs a `deduplication_id`",
         ),
+        (
+            "a delay past what the column holds",
+            Enqueue {
+                delay: Some(Duration::MAX),
+                ..Enqueue::new("demo-queue")
+            },
+            "`delay` must fit in milliseconds as a 64-bit integer",
+        ),
+        (
+            "a zero delay, which means no delay",
+            Enqueue {
+                delay: Some(Duration::ZERO),
+                ..Enqueue::new("demo-queue")
+            },
+            "`delay` must be a positive, non-zero duration",
+        ),
     ];
 
     for (what, enqueue, expected) in cases {
