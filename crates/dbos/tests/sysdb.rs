@@ -4699,6 +4699,9 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
 /// **Two receives on one (workflow, topic) in one process both wait**, and one message goes to
 /// one of them: the other times out with nothing. These are two receives of one execution, at
 /// different steps, as a receive joined with another would be; both are woken by the one send.
+///
+/// The loser keeps waiting after the winner takes the message, so it ends at its deadline; the
+/// timeouts are short for that reason.
 #[tokio::test]
 async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
@@ -4718,7 +4721,7 @@ async fn two_receivers_in_one_process_share_one_message() {
                 0,
                 1,
                 Some("orders"),
-                RECHECK * 20,
+                RECHECK * 5,
                 &owner_token(&*sys, "wf-receiver").await,
             )
             .await
@@ -4732,7 +4735,7 @@ async fn two_receivers_in_one_process_share_one_message() {
                 2,
                 3,
                 Some("orders"),
-                RECHECK * 20,
+                RECHECK * 5,
                 &owner_token(&*sys, "wf-receiver").await,
             )
             .await
@@ -4858,6 +4861,287 @@ async fn two_receivers_cannot_take_the_same_message() {
         1,
         "one message was received, so exactly one may be consumed: {notifications:?}",
     );
+}
+
+/// Whether to skip a test that stages a receive's take blocked on another transaction's lock.
+///
+/// The staging finds the blocked take through PostgreSQL's `pg_stat_activity.wait_event_type`,
+/// which CockroachDB doesn't report.
+fn skip_without_lock_waits(db: &support::TestDatabase) -> bool {
+    let skipping = matches!(db.backend(), Backend::Cockroach);
+    if skipping {
+        eprintln!("skipped on CockroachDB: it doesn't report lock waits in pg_stat_activity");
+    }
+    skipping
+}
+
+/// Starts a receive of `wf-receiver`'s `orders` topic at step 0, and stages a rival take that wins
+/// the message the receive sees: returns the receive and the rival's still-open transaction.
+///
+/// The rival is another receive of the workflow, at step 2, part-way through its take. Its
+/// transaction locks the workflow's row as every take's owner check does, and then consumes the
+/// message, so the receive's probe sees the message (the consume is not yet committed) while its
+/// own take waits on that lock. This returns once it is waiting. Whatever the rival commits, the
+/// receive's take reads only after.
+///
+/// The rival takes the lock only once the receive has recorded its deadline, because recording
+/// the deadline takes the same lock, and a receive blocked there would not have seen the message.
+/// The message is sent after the lock is taken, so the receive cannot take it first; sending from
+/// outside a workflow does not wait on that lock.
+async fn stage_a_take_behind_a_rival(
+    sys: &std::sync::Arc<PostgresSystemDatabase>,
+    pool: &sqlx::PgPool,
+    owner: String,
+    timeout: std::time::Duration,
+) -> (
+    tokio::task::JoinHandle<Result<Option<EncodedValue>, Error>>,
+    sqlx::Transaction<'static, sqlx::Postgres>,
+) {
+    let receiving = {
+        let sys = std::sync::Arc::clone(sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), timeout, &owner)
+                .await
+        })
+    };
+    let mut deadline_recorded = false;
+    for _ in 0..200 {
+        if sys
+            .check_step("wf-receiver", 1, "DBOS.sleep")
+            .await
+            .unwrap()
+            .is_some()
+        {
+            deadline_recorded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(deadline_recorded, "the receive never recorded its deadline");
+
+    let mut rival = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT owner_xid FROM dbos.workflow_status WHERE workflow_uuid = 'wf-receiver' \
+         FOR NO KEY UPDATE",
+    )
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    send_to_receiver(sys, Some("orders"), "\"one\"").await;
+    sqlx::query(
+        "UPDATE dbos.notifications SET consumed = TRUE, consumed_by_function_id = 2 \
+         WHERE destination_uuid = 'wf-receiver' AND topic = 'orders' AND consumed = FALSE",
+    )
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+
+    until_a_take_waits_on_the_owner_lock(pool).await;
+    (receiving, rival)
+}
+
+/// Returns once a statement in this test's database is waiting on a lock while taking the owner
+/// check's lock on a workflow's row: the receive's take, blocked on the rival.
+///
+/// Filtered to the current database because tests share a server.
+async fn until_a_take_waits_on_the_owner_lock(pool: &sqlx::PgPool) {
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND query LIKE 'SELECT owner_xid %FOR NO KEY UPDATE%'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the receive's take never waited on the rival's owner lock");
+}
+
+/// **A receive whose message another receive took keeps waiting**, and the next message sent
+/// before its deadline is its own.
+///
+/// The race is staged rather than hoped for: a rival at another step of the workflow holds the
+/// owner lock and the message, the receive's probe sees the message, and its take waits on the
+/// lock. When the rival commits, the take's consume finds nothing. With ten minutes left that is
+/// no answer, so nothing may be recorded and the receive must still be waiting when the second
+/// message comes.
+#[tokio::test]
+async fn a_recv_whose_message_another_receive_took_waits_for_the_next() {
+    let db = test_database().await;
+    if skip_without_lock_waits(&db) {
+        return;
+    }
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, "wf-receiver").await;
+    let (receiving, rival) = stage_a_take_behind_a_rival(&sys, &pool, owner, RECHECK * 600).await;
+    rival.commit().await.unwrap();
+
+    tokio::time::sleep(BRIEFLY).await;
+    if receiving.is_finished() {
+        panic!(
+            "a take that lost its message with time left ended the receive: {:?}",
+            receiving.await,
+        );
+    }
+    assert!(
+        sys.check_step("wf-receiver", 0, "DBOS.recv")
+            .await
+            .unwrap()
+            .is_none(),
+        "an empty take before the deadline must record nothing",
+    );
+
+    send_to_receiver(&sys, Some("orders"), "\"two\"").await;
+    let taken = tokio::time::timeout(RECHECK * 10, receiving)
+        .await
+        .expect("the receive never took the message sent within its deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.map(|m| m.value), Some("\"two\"".to_owned()));
+    let step = sys
+        .check_step("wf-receiver", 0, "DBOS.recv")
+        .await
+        .unwrap()
+        .expect("receiving is a step");
+    assert_eq!(step.output.as_deref(), Some("\"two\""));
+}
+
+/// **A receive whose message is taken from it past its deadline records that nothing came**, and a
+/// replay returns that without waiting.
+///
+/// The rival holds the owner lock until the deadline has gone by, so the receive's take finds the
+/// message gone with no time left. That, and only that, is when an empty take is the answer.
+///
+/// This guards the deadline exit: a receive that lost its message must still end once its time is
+/// up, rather than going back to wait.
+#[tokio::test]
+async fn a_recv_whose_message_was_taken_past_its_deadline_records_nothing_received() {
+    let db = test_database().await;
+    if skip_without_lock_waits(&db) {
+        return;
+    }
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, "wf-receiver").await;
+    // Long enough for the staging to finish before the deadline, so the take is under way when it
+    // passes.
+    let timeout = RECHECK * 5;
+    let (receiving, rival) = stage_a_take_behind_a_rival(&sys, &pool, owner.clone(), timeout).await;
+    // The receive began before its take waited, so its deadline is behind this.
+    tokio::time::sleep(timeout + BRIEFLY).await;
+    rival.commit().await.unwrap();
+
+    let taken = tokio::time::timeout(RECHECK * 10, receiving)
+        .await
+        .expect("the receive never finished after its deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken, None);
+    let step = sys
+        .check_step("wf-receiver", 0, "DBOS.recv")
+        .await
+        .unwrap()
+        .expect("a timeout is a result, and results are recorded");
+    assert_eq!(step.output, None, "nothing received is a NULL output");
+
+    let began = Timestamp::now();
+    let replayed = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, &owner),
+    )
+    .await
+    .expect("a replay waited for a message instead of returning the recorded timeout")
+    .unwrap();
+    assert_eq!(replayed, None);
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK,
+        "a replay must not wait at all",
+    );
+}
+
+/// **A waiting receive whose workflow has changed hands takes nothing**: its take is refused, and
+/// the message stays for the new owner.
+///
+/// The receive is waiting when the workflow is handed over, and the message arrives after, so it
+/// is the take's own owner check, not the one before the wait, that refuses it.
+#[tokio::test]
+async fn a_waiting_recv_whose_workflow_changed_hands_leaves_the_message() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(sys);
+    sys.init_workflow(&workflow("wf-receiver"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, "wf-receiver").await;
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, &owner)
+                .await
+        })
+    };
+    let mut deadline_recorded = false;
+    for _ in 0..200 {
+        if sys
+            .check_step("wf-receiver", 1, "DBOS.sleep")
+            .await
+            .unwrap()
+            .is_some()
+        {
+            deadline_recorded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(deadline_recorded, "the receive never recorded its deadline");
+
+    sqlx::query(
+        "UPDATE dbos.workflow_status SET owner_xid = 'new-owner' \
+         WHERE workflow_uuid = 'wf-receiver'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+
+    let taken = tokio::time::timeout(RECHECK * 10, receiving)
+        .await
+        .expect("the receive never tried to take the message")
+        .unwrap();
+    assert!(refused(taken, "wf-receiver"));
+    assert!(
+        sys.check_step("wf-receiver", 0, "DBOS.recv")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused take records nothing",
+    );
+    let unconsumed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM dbos.notifications \
+         WHERE destination_uuid = 'wf-receiver' AND topic = 'orders' AND consumed = FALSE",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unconsumed, 1, "the message stays for the new owner");
 }
 
 /// A receive inside a cancelled workflow stops rather than waiting out its timeout.
