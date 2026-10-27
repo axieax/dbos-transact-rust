@@ -244,7 +244,9 @@ pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Rac
         if winner >= branches.len() {
             // `Some` wherever a row was read at all — `check` answers `None` for every placement
             // that holds no step — so this arm knows both halves rather than defaulting them.
-            let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
+            let (workflow_id, step_id) = placement
+                .step_position()
+                .map_or(("", 0), |at| (at.workflow_id, at.step_id));
             return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                 // `expected` is what this run asks for and `recorded` what the row holds, which is
                 // the order `Error::UnexpectedStep` prints them in.
@@ -345,7 +347,7 @@ mod tests {
     use super::*;
     use crate::context::Ctx;
     use crate::step::step;
-    use crate::sysdb::types::{NewWorkflow, Submission};
+    use crate::sysdb::types::NewWorkflow;
     use crate::{Config, DBOS};
 
     /// A launched instance and a workflow row for the race to record against.
@@ -364,9 +366,10 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
+            .init_workflow(&NewWorkflow::new(id), None)
             .await
             .expect("could not create the workflow row");
+        crate::context::own_for_test(&db, id).await;
         (dbos, db)
     }
 
@@ -374,6 +377,7 @@ mod tests {
         Ctx::new(
             dbos.executor("test").expect("launched"),
             id,
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         )
@@ -597,6 +601,7 @@ mod tests {
                 )),
                 Some(executor.connection().serializer().name()),
                 None,
+                crate::context::TEST_OWNER,
             )
             .await
             .expect("could not plant the winner's row");

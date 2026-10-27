@@ -146,7 +146,7 @@ async fn a_rewound_workflow_runs_again_under_the_same_id() {
     let after = row(&reader, id).await;
     assert_eq!(after.status, WorkflowStatus::Success);
     assert_eq!(
-        after.application_version, before.application_version,
+        after.app_version, before.app_version,
         "a rewind with no version keeps the one the workflow had"
     );
     assert_eq!(after.created_at, before.created_at);
@@ -247,12 +247,11 @@ async fn a_rewind_resets_the_row_and_discards_the_history() {
         .await
         .expect("start failed");
     dbos.send_with(
-        id,
-        &"hello",
-        dbos::SendOptions {
+        dbos::SendMessage {
             topic: Some("inbox"),
-            ..Default::default()
+            ..dbos::SendMessage::new(id, &"hello")
         },
+        dbos::SendOptions::default(),
     )
     .await
     .expect("send failed");
@@ -279,7 +278,7 @@ async fn a_rewind_resets_the_row_and_discards_the_history() {
     dbos.rewind_with::<Option<String>, EngineOnly>(
         id,
         RewindOptions {
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             queue_partition_key: Some("new-key"),
             ..RewindOptions::default()
         },
@@ -399,7 +398,7 @@ async fn a_rewind_clears_an_outcome_held_only_in_the_legacy_columns() {
     dbos.rewind_with::<u32, EngineOnly>(
         id,
         RewindOptions {
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             ..RewindOptions::default()
         },
     )
@@ -444,12 +443,11 @@ async fn a_rewind_discards_the_messages_the_discarded_steps_consumed() {
         let dbos = dbos.clone();
         async move {
             dbos.send_with(
-                id,
-                &message,
-                dbos::SendOptions {
+                dbos::SendMessage {
                     topic: Some(topic),
-                    ..Default::default()
+                    ..dbos::SendMessage::new(id, &message)
                 },
+                dbos::SendOptions::default(),
             )
             .await
             .expect("send failed")
@@ -508,7 +506,7 @@ async fn a_rewind_discards_the_messages_the_discarded_steps_consumed() {
         id,
         RewindOptions {
             start_step: 2,
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             ..RewindOptions::default()
         },
     )
@@ -572,7 +570,7 @@ async fn a_rewind_reverts_the_events_published_past_the_cut() {
         id,
         RewindOptions {
             start_step: 2,
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             ..RewindOptions::default()
         },
     )
@@ -674,7 +672,7 @@ async fn a_rewind_chooses_the_queue_and_version_the_rerun_gets() {
     let parked = row(&reader, id).await;
     assert_eq!(parked.queue_name.as_deref(), Some(INTERNAL_QUEUE));
     assert_eq!(parked.queue_partition_key, None, "the old key is not kept");
-    assert_eq!(parked.application_version.as_deref(), Some("not-deployed"));
+    assert_eq!(parked.app_version.as_deref(), Some("not-deployed"));
 
     // The internal queue is polled here, but only for this executor's version.
     tokio::time::sleep(Duration::from_secs(2)).await;

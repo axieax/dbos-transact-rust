@@ -27,27 +27,33 @@ pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
 /// another — it is a cross-SDK constant, not an encoding this layer is free to change.
 pub const NULL_TOPIC: &str = "__null__topic__";
 
+/// The serialization tag of portable JSON, the encoding every DBOS SDK reads and writes.
+///
+/// A cross-SDK constant like [`NULL_TOPIC`]: every implementation writes and recognises this exact
+/// string, so it is defined once, here, for every row tagged with it — the serializer's portable
+/// payloads, a durable sleep's wake time, and the stream-closed marker [`STREAM_CLOSED`]. It lives
+/// in this layer rather than with the serializer because this layer writes it itself, and does not
+/// depend on the serializer.
+pub const PORTABLE_JSON: &str = "portable_json";
+
 /// The value written to a stream to mark it closed, as stored: the string
 /// `__DBOS_STREAM_CLOSED__` encoded as portable JSON, quotes included.
 ///
 /// A sentinel entry rather than a column, so closing is an ordinary append and a reader learns
-/// of it in the same pass that reads the values. Always labelled `portable_json`, whatever the
+/// of it in the same pass that reads the values. Always labelled [`PORTABLE_JSON`], whatever the
 /// workflow's serializer, so a reader recognises it without knowing which serializer wrote the
 /// stream. **A close is this value under that label**, never the value alone: a user value
 /// encoded by another JSON-based serializer can be the same text.
 pub const STREAM_CLOSED: &str = "\"__DBOS_STREAM_CLOSED__\"";
 
-/// The label [`STREAM_CLOSED`] is always written under.
-pub const STREAM_CLOSED_SERIALIZATION: &str = "portable_json";
-
-/// Whether a stored stream entry is a close: [`STREAM_CLOSED`] under
-/// [`STREAM_CLOSED_SERIALIZATION`], and never the value alone.
+/// Whether a stored stream entry is a close: [`STREAM_CLOSED`] under [`PORTABLE_JSON`], and never
+/// the value alone.
 ///
 /// The one test for a close. A reader ends on it; a write derives its step name from it; and a
 /// rewind deletes the closes past its cut by the same pair, so a reader stops exactly where a
 /// rewind would reopen the stream.
 pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
-    value == STREAM_CLOSED && serialization == Some(STREAM_CLOSED_SERIALIZATION)
+    value == STREAM_CLOSED && serialization == Some(PORTABLE_JSON)
 }
 
 /// Partitions a single partitioned sweep will look at.
@@ -74,13 +80,14 @@ use std::time::Duration;
 
 use types::step_names;
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Debounce, DebounceRequest,
-    EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
-    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    AppScope, ApplicationRowCounts, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
+    DebounceRequest, Dequeued, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
+    GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
+    NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
+    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
+    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp,
+    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult,
+    WorkflowOwner, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -110,26 +117,22 @@ use types::{
 /// and an integer, not a connection. Nothing is broken either way; worth the team having seen it.
 #[async_trait]
 pub trait SystemDatabase: Send + Sync {
-    /// Records a workflow, reconciling with any row already under that id.
+    /// Records a workflow, or finds the row already under that id.
     ///
     /// The same id submitted twice is one workflow, which is what makes a retried enqueue safe.
-    /// Reconciling is not a no-op, though — three things happen on conflict:
+    /// **A row already there is left as it is**, and reported: its status, its deadline and how
+    /// its payloads are encoded. A different function under the same id is an error (name, class
+    /// and config must match); a differing queue is only a warning, since requeueing elsewhere is
+    /// legitimate.
     ///
-    /// - **Recovery attempts are counted**, but only when the existing row is not merely queued
-    ///   and only when the caller is recovering or dequeuing. Passing the limit parks the
-    ///   workflow as [`types::WorkflowStatus::MaxRecoveryAttemptsExceeded`] and errors.
-    /// - **The executor is re-stamped**, unless this is an enqueue — a queued workflow has no
-    ///   executor yet, and claiming one would be wrong.
-    /// - **A different function under the same id is an error.** Name, class, and config must
-    ///   match; a differing queue is only a warning, since requeueing elsewhere is legitimate.
-    ///
-    /// `max_recovery_attempts` of `None` disables parking entirely. [`Submission`] says why the
-    /// workflow is being submitted, and so whether it may claim a row another owner holds.
-    ///
-    /// The owner identity behind the single-execution guard is generated in here rather than
-    /// passed in, and generated once per call — before any retry the implementation makes. A
-    /// retry that generated a fresh identity after a lost commit acknowledgement would fail to
-    /// recognise its own write and conclude another executor owned the row.
+    /// **Two tokens.** Each call generates a creator token, once, before any retry the
+    /// implementation makes, and a new row records it as `creator_xid`. The caller should run the
+    /// workflow only if the row holds its token, which is what
+    /// [`should_execute`](types::WorkflowInitResult::should_execute) reports: a retry after a lost
+    /// commit acknowledgement still recognises its own insert, and any other caller joins. A row
+    /// inserted `PENDING` is also owned by its creator from the start (`owner_xid`, the token the
+    /// running execution presents on every write); a queued or delayed one is owned by nobody
+    /// until a dequeue claims it.
     ///
     /// **`caller` makes the child's row and the parent's record of it one write.** A start from
     /// inside a workflow is a step of that workflow, and as two statements the pair has a gap: a
@@ -155,10 +158,12 @@ pub trait SystemDatabase: Send + Sync {
     async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
-        max_recovery_attempts: Option<i64>,
-        submission: Submission,
         caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error>;
+
+    /// The database's clock as of this call, paired with the moment the answer arrived: what a
+    /// wait for a deadline the database set is measured from.
+    async fn database_time(&self) -> Result<DatabaseTime, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error>;
@@ -197,13 +202,18 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **Losing here is a value; losing in [`record_step`](Self::record_step) is an error.** The
     /// two look parallel and deliberately are not. A workflow whose outcome was recorded by someone
-    /// else has simply been superseded, and the right move is to adopt what is stored — routine
-    /// enough to be a return value. A step recorded by someone else means two executions of one
-    /// workflow are live at the same moment, which every implementation raises on.
+    /// else, or that has been handed to another execution, has simply been superseded, and the
+    /// right move is to adopt what is stored — routine enough to be a return value. A step
+    /// recorded twice is this execution's own nondeterminism, and is raised.
+    ///
+    /// `owner_xid` is the token of the execution recording it, which must still own the workflow:
+    /// one that has been handed off gets `AlreadyFinished` too, and adopts the new owner's outcome.
+    /// The write clears the owner.
     async fn record_workflow_outcome(
         &self,
         workflow_id: &str,
         outcome: Outcome<'_>,
+        owner_xid: &str,
     ) -> Result<OutcomeWrite, Error>;
 
     /// Waits for a workflow to finish and reports how it did.
@@ -398,18 +408,17 @@ pub trait SystemDatabase: Send + Sync {
     /// write and its step checkpoint **commit together** — see
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
+    ///
+    /// A [`WorkflowDelay::For`] whose release instant cannot be stored as epoch milliseconds in an
+    /// `i64` is [`Error::InvalidInput`], and the row is not touched. Given a `caller`, the refusal
+    /// is decided inside the step and recorded as its outcome like any other failure, so a replay
+    /// reads back the first run's answer rather than deciding again against a later clock.
     async fn set_workflow_delay(
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
-
-    /// Puts a running workflow back on its queue, reporting whether it moved.
-    ///
-    /// For an executor that claimed a queued workflow and then could not run it. Only applies to
-    /// a `PENDING` row that has a queue to return to.
-    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error>;
 
     /// Replaces a workflow's attributes. `None` clears them.
     ///
@@ -457,6 +466,19 @@ pub trait SystemDatabase: Send + Sync {
         recovery_queue: &str,
     ) -> Result<Vec<String>, Error>;
 
+    /// Parks workflows that have been dispatched too often, as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`,
+    /// returning the ids that moved.
+    ///
+    /// Only rows still `PENDING` with at least `min_recovery_attempts` recorded move: the caller
+    /// read that count from the row it claimed, so a row a resume reset, or another execution
+    /// settled, since then is left alone. Clears what leaving a queue clears, and `owner_xid`, so
+    /// no execution still holds it.
+    async fn dead_letter_workflows(
+        &self,
+        workflow_ids: &[&str],
+        min_recovery_attempts: i64,
+    ) -> Result<Vec<String>, Error>;
+
     /// Releases delayed workflows whose time has come, returning how many moved.
     ///
     /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
@@ -465,6 +487,37 @@ pub trait SystemDatabase: Send + Sync {
     /// rather than bounce this one. Python does this and explains it; **Java does not**, and its
     /// version predates the column.
     async fn transition_delayed_workflows(&self) -> Result<u64, Error>;
+
+    /// Cancels up to `limit` unsettled workflows whose deadline has passed, oldest deadline first,
+    /// returning the ids it cancelled.
+    ///
+    /// The workflow-timeout sweep, which every executor of an application runs. It matches on each
+    /// row's own deadline, whoever owns the row and whichever unsettled status it is in, so a
+    /// workflow nobody is running still times out: an `ENQUEUED` or `DELAYED` one no worker has
+    /// claimed, or a `PENDING` one whose executor died. Scoped to this application's rows and
+    /// unclaimed ones, like the other sweeps.
+    ///
+    /// - **Clears what a cancel clears**, plus `owner_xid`, so no execution still holds the row.
+    /// - **Children are not cascaded.** A child that inherited its parent's deadline holds the same
+    ///   instant and is swept with it; one with its own budget or none is left alone.
+    /// - **Rows another transaction has locked are skipped**, such as one a dequeue is claiming or
+    ///   a peer's sweep is cancelling, and left to the next pass.
+    ///
+    /// The deadline is compared against the database's clock, so every executor sweeping the same
+    /// rows agrees on when a deadline has passed.
+    async fn cancel_timed_out_workflows(&self, limit: i64) -> Result<Vec<String>, Error>;
+
+    /// Cancels one workflow if it is unsettled and the database's clock has passed its deadline,
+    /// reporting whether it did.
+    ///
+    /// What an execution whose local timer has fired uses, so its timeout doesn't depend on the
+    /// sweep reaching the row. It writes what
+    /// [`cancel_timed_out_workflows`](Self::cancel_timed_out_workflows) writes, and decides
+    /// expiry on the same clock.
+    ///
+    /// **Only while `owner_xid` still owns the workflow**, like every other write an execution
+    /// makes. A run that has lost the workflow leaves its timeout to the sweep and to the new owner.
+    async fn cancel_if_timed_out(&self, workflow_id: &str, owner_xid: &str) -> Result<bool, Error>;
 
     /// Cancels workflows, returning the ids that actually moved.
     ///
@@ -491,6 +544,16 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
+    /// **`from_workflow` is the workflow making the call, which may not target itself**: named
+    /// directly, or, with `cancel_children`, through an ancestor whose tree it is inside. Either is
+    /// [`Error::InvalidInput`] and nothing moves. A workflow that wants to stop returns or fails
+    /// instead. It is the caller's workflow whenever `caller` is given, and also for a call made
+    /// inside a step body, which records nothing and so has no `caller`. The check runs in the
+    /// transaction that records the call, so a recorded refusal is the call's answer and a replay
+    /// raises it again rather than deciding it afresh. A [`Client`](crate::Client) passes `None`
+    /// and is not checked: a client is outside every workflow, even one made inside a workflow's
+    /// code.
+    ///
     /// **The cascade is one transaction, which buys atomicity and not exclusion.** A failure
     /// partway through leaves the tree untouched rather than half-cancelled — that is the part it
     /// buys. It does not stop a child being spawned behind the walk: at READ COMMITTED these
@@ -512,6 +575,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
@@ -532,18 +596,23 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
-    /// TODO(dbos-team): UPSTREAM item 27. The only guard is that the row is not terminal, which is
-    /// the predicate all five share — so `PENDING` passes, and resuming a workflow that is
-    /// executing right now re-enqueues it underneath its own execution. The next sweep claims the
-    /// row and dispatches it, and two executions of one id run concurrently: neither is told about
-    /// the other, and the running one is not cancelled, so nothing stops it at its next step. It
-    /// cannot simply be tightened here, because `PENDING` means *owned*, not *running*, and the
-    /// row cannot say whether the owner is alive — a workflow left `PENDING` by a dead node is the
-    /// case an operator most wants to resume by hand.
+    /// `from_workflow` may not be among `workflow_ids`, as in
+    /// [`cancel_workflows`](Self::cancel_workflows): a resume would hand the workflow to a new
+    /// execution while the caller is the old one, so the caller's own record of the call would be
+    /// refused.
+    ///
+    /// Past that refusal, the only guard is that the row is not terminal, so `PENDING` passes:
+    /// resuming a workflow that is executing right now re-enqueues it underneath its own execution,
+    /// and the claim that dequeues it starts a new one. Clearing `owner_xid` is what stops the old
+    /// one: its next write is refused, and it waits for the new one's outcome. It can't simply be
+    /// refused here, because `PENDING` means *owned*, not *running*, and the row can't say whether
+    /// the owner is alive — a workflow left `PENDING` by a dead node is the case an operator most
+    /// wants to resume by hand.
     async fn resume_workflows(
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
@@ -747,6 +816,7 @@ pub trait SystemDatabase: Send + Sync {
         serialization: Option<&str>,
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error>;
 
     /// Delivers many messages to workflows, in one transaction.
@@ -776,6 +846,7 @@ pub trait SystemDatabase: Send + Sync {
         serialization: Option<&str>,
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error>;
 
     /// Takes the oldest message sent to a workflow, waiting up to `timeout` for one to arrive.
@@ -806,14 +877,11 @@ pub trait SystemDatabase: Send + Sync {
     /// because nothing equals `NULL` and a receiver selecting on it would never find its own
     /// message.
     ///
-    /// **Two concurrent receivers on one (workflow, topic) is
-    /// [`Error::ConcurrentRecv`].** One message goes to one of them, so the other can only wait out
-    /// its timeout and report nothing — which the sender cannot distinguish from not having sent.
-    /// Python and Go reject it; TypeScript and Java allow it. Erring towards the error is the
-    /// recoverable direction: a layer above can swallow one this layer raises, and cannot
-    /// manufacture one it never raised. The guard is per process; two receivers in *different*
-    /// processes are arbitrated at the database by the consuming statement, which is the case
-    /// recovery actually produces.
+    /// **Two concurrent receivers on one (workflow, topic) both wait**, and both are woken; the
+    /// consuming statement gives a message to one of them. Two receives of one execution produce
+    /// two, and the one that missed out waits on to its deadline. So does a workflow handed to a
+    /// new execution while the old one still waits, in this process or another, and there
+    /// `owner_xid` refuses the old one's consume, so the message is the new owner's.
     ///
     /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
     /// raises a timeout error, in its engine rather than at this layer.
@@ -829,6 +897,7 @@ pub trait SystemDatabase: Send + Sync {
         timeout_step_id: i32,
         topic: Option<&str>,
         timeout: Duration,
+        owner_xid: &str,
     ) -> Result<Option<EncodedValue>, Error>;
 
     /// Appends a value to a workflow's stream.
@@ -849,6 +918,7 @@ pub trait SystemDatabase: Send + Sync {
     /// the cost of a query per write. A reader stops at the sentinel, so an entry appended after
     /// it is invisible rather than corrupting — and a workflow that writes after closing has a
     /// bug this layer cannot fix by refusing one of the two writes.
+    #[allow(clippy::too_many_arguments)]
     async fn write_stream(
         &self,
         workflow_id: &str,
@@ -857,6 +927,7 @@ pub trait SystemDatabase: Send + Sync {
         value: &str,
         serialization: Option<&str>,
         written_by: WrittenBy,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Marks a stream closed, so a reader knows no more values are coming.
@@ -870,6 +941,7 @@ pub trait SystemDatabase: Send + Sync {
         step_id: i32,
         key: &str,
         written_by: WrittenBy,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
@@ -926,8 +998,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// - **the same time** — this caller's own write, acknowledged but not observed. Retrying it
     ///   is correct and the call succeeds.
-    /// - **a different time** — another execution got there first, which is
-    ///   [`Error::StepAlreadyRecorded`].
+    /// - **a different time** — this execution recorded the step already, which is
+    ///   [`Error::StepNondeterminism`]. No other execution can have: the owner check runs first.
     ///
     /// So a caller that retries must pass the same `timing` both times — hold it in a variable
     /// rather than building it at the call site inside a retry loop. Python spells the rule out
@@ -940,6 +1012,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Recording also **re-stamps the workflow's executor id**, because an executor that runs a
     /// step is by definition the one running the workflow.
+    ///
+    /// `owner_xid` is the recording execution's token: the record lands only while the workflow is
+    /// still that execution's (see [`WorkflowOwner`]).
+    #[allow(clippy::too_many_arguments)]
     async fn record_step(
         &self,
         workflow_id: &str,
@@ -948,6 +1024,7 @@ pub trait SystemDatabase: Send + Sync {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Reads a workflow's steps in execution order.
@@ -993,10 +1070,15 @@ pub trait SystemDatabase: Send + Sync {
     /// not taken a minute. Python and TypeScript expose that as a flag on this method; here it is
     /// the implementation's business, because no caller of *this* method wants it — a caller
     /// registering a deadline is calling the blocking read, not recording a sleep by hand.
+    ///
+    /// A `duration` whose wake time cannot be stored as epoch milliseconds in an `i64` is
+    /// [`Error::InvalidInput`] — but only once the record has been looked for, and the refusal is
+    /// itself recorded, as the step's error in the caller's codec. Whether the wake time fits
+    /// depends on the clock, so neither outcome is decided again: a replay gets back the wake
+    /// time or the refusal the first run recorded, whatever its own clock would say.
     async fn record_sleep(
         &self,
-        workflow_id: &str,
-        step_id: i32,
+        caller: StepCaller<'_>,
         duration: Duration,
     ) -> Result<Timestamp, Error>;
 
@@ -1014,6 +1096,7 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Setting the same key twice replaces the current value and adds a history row, so the
     /// history is what a fork copies forward and the current value is what a reader sees.
+    #[allow(clippy::too_many_arguments)]
     async fn set_event(
         &self,
         workflow_id: &str,
@@ -1021,6 +1104,7 @@ pub trait SystemDatabase: Send + Sync {
         key: &str,
         value: &str,
         serialization: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Reads a key another workflow published, waiting up to `timeout` for it to appear.
@@ -1256,7 +1340,7 @@ pub trait SystemDatabase: Send + Sync {
     /// tick*, which is the ordinary case rather than an error.
     ///
     /// **Only this application's workflows, plus unclaimed ones**, and claiming is part of the
-    /// same statement that starts them — see [`types::Applications`]. An unclaimed workflow is
+    /// same statement that starts them — see [`types::AppScope`]. An unclaimed workflow is
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
@@ -1296,15 +1380,37 @@ pub trait SystemDatabase: Send + Sync {
     /// `application_version` is this executor's. A workflow with no version recorded is eligible
     /// only when this executor is running the *latest* registered version, so a rolling deploy
     /// does not hand unversioned work to the code being replaced.
+    ///
+    /// `owner_xid` is this claim's token, one per call: every row it claims is owned by it, and
+    /// the executions dispatched from them present it on every write they make.
+    ///
+    /// **A limit with no room left is reported, not just obeyed.** The claim then returns before
+    /// selecting anything, naming the limit in [`Dequeued::stopped_by`]. A caller walking
+    /// partitions reads it to end the walk when the limit is queue-wide, since every other key
+    /// would come back the same; see [`DequeueStop::spans_partitions`].
+    ///
+    /// [`DequeueStop::spans_partitions`]: types::DequeueStop::spans_partitions
+    #[allow(clippy::too_many_arguments)]
     async fn start_queued_workflows(
         &self,
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        owner_xid: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
         partition_local_running_count: i64,
-    ) -> Result<Vec<String>, Error>;
+    ) -> Result<Dequeued, Error>;
+
+    /// How many of a queue's workflows are `PENDING` across every executor.
+    ///
+    /// The population [`start_queued_workflows`](Self::start_queued_workflows) counts against the
+    /// queue's global concurrency, and by the same predicate: only rows this application could
+    /// dequeue, or unclaimed ones. A caller walking partitions reads it once per poll to learn how
+    /// much room the queue has left before paying a claim per partition to find out. It is a
+    /// snapshot, not a reservation: each claim counts again in its own transaction, so a stale
+    /// figure costs a wasted claim or a shorter walk, never an overrun.
+    async fn count_pending_queue_workflows(&self, queue_name: &str) -> Result<i64, Error>;
 
     /// The partitions of a queue that currently have work waiting.
     ///
@@ -1345,6 +1451,7 @@ pub trait SystemDatabase: Send + Sync {
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        owner_xid: &str,
         max_tasks: Option<i64>,
     ) -> Result<Vec<String>, Error>;
 
@@ -1356,10 +1463,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Reads the registered queues, scoped to the applications asked for.
     ///
-    /// A search rather than an address, so [`Applications::Unset`] means this handle's own plus
-    /// the unclaimed ones — see [`types::Applications`].
-    async fn list_queues(&self, applications: &Applications<'_>)
-    -> Result<Vec<QueueRecord>, Error>;
+    /// A search rather than an address, so [`AppScope::Unset`] means this handle's own plus
+    /// the unclaimed ones — see [`types::AppScope`].
+    async fn list_queues(&self, applications: &AppScope<'_>) -> Result<Vec<QueueRecord>, Error>;
 
     /// Changes the fields of a registered queue that an update names, leaving the rest.
     ///
@@ -1566,7 +1672,7 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Reads the schedules matching a filter.
     ///
-    /// A search, so [`ScheduleFilter::applications`] defaults to this handle's own plus the
+    /// A search, so [`ScheduleFilter::app_scope`] defaults to this handle's own plus the
     /// unclaimed rather than to every application's.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
@@ -1713,7 +1819,7 @@ pub trait SystemDatabase: Send + Sync {
     /// compares the **child id**, since the timestamp here spans only the launch and a retry
     /// would stamp a new one — while the child id it is recording is necessarily the same. A
     /// *different* child at the same position is nondeterminism in the parent, and is reported
-    /// as [`Error::StepAlreadyRecorded`]. Python splits the two for exactly this reason; Java
+    /// as [`Error::StepNondeterminism`]. Python splits the two for exactly this reason; Java
     /// reaches it by passing null timestamps and skipping the comparison.
     async fn record_child_workflow(
         &self,
@@ -1722,6 +1828,7 @@ pub trait SystemDatabase: Send + Sync {
         step_id: i32,
         step_name: &str,
         started_at: Option<Timestamp>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Reads back a recorded child-workflow await, or `None` if the parent has not got this far.
@@ -1760,6 +1867,7 @@ pub trait SystemDatabase: Send + Sync {
     /// [`GET_RESULT`](crate::sysdb::types::step_names::GET_RESULT), which is the name
     /// [`check_child_result`](Self::check_child_result) reads back, so a caller that could choose
     /// would only be choosing wrong.
+    #[allow(clippy::too_many_arguments)]
     async fn record_child_result(
         &self,
         parent_workflow_id: &str,
@@ -1768,5 +1876,6 @@ pub trait SystemDatabase: Send + Sync {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 }

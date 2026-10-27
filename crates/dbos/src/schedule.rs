@@ -51,7 +51,7 @@ use std::time::SystemTime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint::{PendingStep, StepPlacement};
+use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::client::Client;
 use crate::connection::Connection;
 use crate::context::Ctx;
@@ -61,7 +61,8 @@ use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
 use crate::registry::{Snapshot, WorkflowKey, WorkflowRef};
 use crate::serialization::{
-    PayloadEncoding, SerializationFormat, Serializer, decode, encode, encode_input,
+    Floats, NonFinite, PayloadEncoding, SerializationFormat, Serializer, decode, encode,
+    encode_input,
 };
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
@@ -129,13 +130,15 @@ mod rfc3339 {
 /// the JSON data instead, and written as it, so that both directions agree.
 mod json_data {
     use serde::de::DeserializeOwned;
+
+    use crate::serialization::{Floats, NonFinite};
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 
     pub(super) fn serialize<C: Serialize, S: Serializer>(
         context: &C,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serde_json::to_value(context)
+        serde_json::to_value(Floats::new(context, NonFinite::Refuse))
             .map_err(ser::Error::custom)?
             .serialize(serializer)
     }
@@ -209,7 +212,7 @@ pub struct ScheduleSpec {
     ///
     /// A client with no application name and no name here writes an **unclaimed** schedule,
     /// which every application sharing the database fires.
-    pub application_name: Option<String>,
+    pub app_name: Option<String>,
 }
 
 impl ScheduleSpec {
@@ -247,12 +250,12 @@ impl ScheduleSpec {
             schedule_name: schedule_name.into(),
             schedule: schedule.into(),
             workflow,
-            context: serde_json::to_value(context)
+            context: serde_json::to_value(Floats::new(context, NonFinite::Refuse))
                 .map_err(|source| Error::encode_failed("schedule context", source))?,
             automatic_backfill: false,
             cron_timezone: None,
             queue_name: None,
-            application_name: None,
+            app_name: None,
         })
     }
 
@@ -298,7 +301,7 @@ impl ScheduleSpec {
             automatic_backfill: self.automatic_backfill,
             cron_timezone: self.cron_timezone.as_deref(),
             queue_name: self.queue_name.as_deref(),
-            application_name: self.application_name.as_deref(),
+            application_name: self.app_name.as_deref(),
             ..NewSchedule::new(&self.schedule_name, &self.workflow.name, &self.schedule)
         }
     }
@@ -377,7 +380,7 @@ impl ScheduleChange<'_> {
 #[derive(Debug, Clone)]
 pub struct Schedule {
     id: String,
-    name: String,
+    schedule_name: String,
     workflow: WorkflowKey,
     schedule: String,
     status: ScheduleStatus,
@@ -388,7 +391,7 @@ pub struct Schedule {
     automatic_backfill: bool,
     cron_timezone: Option<String>,
     queue_name: Option<String>,
-    application_name: Option<String>,
+    app_name: Option<String>,
 }
 
 /// Two views are equal when they read the same row: which serializer reads the context is not
@@ -397,7 +400,7 @@ impl PartialEq for Schedule {
     fn eq(&self, other: &Self) -> bool {
         let Schedule {
             id,
-            name,
+            schedule_name,
             workflow,
             schedule,
             status,
@@ -407,10 +410,10 @@ impl PartialEq for Schedule {
             automatic_backfill,
             cron_timezone,
             queue_name,
-            application_name,
+            app_name,
         } = self;
         *id == other.id
-            && *name == other.name
+            && *schedule_name == other.schedule_name
             && *workflow == other.workflow
             && *schedule == other.schedule
             && *status == other.status
@@ -419,7 +422,7 @@ impl PartialEq for Schedule {
             && *automatic_backfill == other.automatic_backfill
             && *cron_timezone == other.cron_timezone
             && *queue_name == other.queue_name
-            && *application_name == other.application_name
+            && *app_name == other.app_name
     }
 }
 
@@ -435,7 +438,7 @@ impl Schedule {
                 None,
             ),
             id: record.schedule_id,
-            name: record.schedule_name,
+            schedule_name: record.schedule_name,
             schedule: record.schedule,
             status: record.status,
             context: record.context,
@@ -445,13 +448,13 @@ impl Schedule {
             automatic_backfill: record.automatic_backfill,
             cron_timezone: record.cron_timezone,
             queue_name: record.queue_name,
-            application_name: record.application_name,
+            app_name: record.application_name,
         }
     }
 
     /// The schedule's name, unique across every application sharing the database.
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn schedule_name(&self) -> &str {
+        &self.schedule_name
     }
 
     /// The id the database generated for the schedule. A schedule deleted and created again under
@@ -512,8 +515,8 @@ impl Schedule {
 
     /// The application that owns the schedule, or `None` if it is unclaimed and every
     /// application sharing the database fires it.
-    pub fn application_name(&self) -> Option<&str> {
-        self.application_name.as_deref()
+    pub fn app_name(&self) -> Option<&str> {
+        self.app_name.as_deref()
     }
 }
 
@@ -568,7 +571,7 @@ impl DBOS {
                     )
                     .await?;
                 }
-                conn.create_schedule(spec, placement.step()).await
+                conn.create_schedule(spec, placement.step_writer()).await
             },
         )
     }
@@ -618,7 +621,7 @@ impl DBOS {
             move |executor, placement| async move {
                 let records = executor
                     .connection()
-                    .list_schedules(filter, placement.step())
+                    .list_schedules(filter, placement.step_writer())
                     .await?;
                 let serializer = executor.serializer();
                 Ok(records
@@ -637,7 +640,7 @@ impl DBOS {
             move |executor, placement| async move {
                 let record = executor
                     .connection()
-                    .get_schedule(name, placement.step())
+                    .get_schedule(name, placement.step_writer())
                     .await?;
                 Ok(record.map(|record| Schedule::from_record(record, executor.serializer())))
             },
@@ -675,7 +678,7 @@ impl DBOS {
                 {
                     refuse_unknown_queue(conn, name, queue, OPERATION).await?;
                 }
-                conn.update_schedule(name, change, context.as_deref(), placement.step())
+                conn.update_schedule(name, change, context.as_deref(), placement.step_writer())
                     .await
             },
         )
@@ -694,7 +697,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .set_schedule_status(name, ScheduleStatus::Paused, placement.step())
+                    .set_schedule_status(name, ScheduleStatus::Paused, placement.step_writer())
                     .await
             },
         )
@@ -708,7 +711,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .set_schedule_status(name, ScheduleStatus::Active, placement.step())
+                    .set_schedule_status(name, ScheduleStatus::Active, placement.step_writer())
                     .await
             },
         )
@@ -724,7 +727,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .delete_schedule(name, placement.step())
+                    .delete_schedule(name, placement.step_writer())
                     .await
             },
         )
@@ -902,7 +905,7 @@ impl Connection {
     pub(crate) async fn create_schedule(
         &self,
         spec: &ScheduleSpec,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         let context = spec.encode_context(self.serializer())?;
         self.sysdb()
@@ -934,7 +937,7 @@ impl Connection {
     pub(crate) async fn list_schedules(
         &self,
         filter: &ScheduleFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<ScheduleRecord>> {
         self.sysdb()
             .list_schedules(filter, self.step_caller(caller))
@@ -945,7 +948,7 @@ impl Connection {
     pub(crate) async fn get_schedule(
         &self,
         name: &str,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<Option<ScheduleRecord>> {
         self.sysdb()
             .get_schedule(name, self.step_caller(caller))
@@ -959,7 +962,7 @@ impl Connection {
         name: &str,
         change: &ScheduleChange<'_>,
         context: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         let update = ScheduleUpdate {
             schedule: change.schedule,
@@ -980,7 +983,7 @@ impl Connection {
         &self,
         name: &str,
         status: ScheduleStatus,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .set_schedule_status(name, status, self.step_caller(caller))
@@ -997,7 +1000,7 @@ impl Connection {
     pub(crate) async fn delete_schedule(
         &self,
         name: &str,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .delete_schedule(name, self.step_caller(caller))
@@ -1278,6 +1281,21 @@ mod tests {
         assert_eq!(decoded.context, "emea");
     }
 
+    /// A schedule's context goes through a `serde_json::Value`, which can't hold a non-finite
+    /// float, so one is refused rather than stored as `null`, whichever way the context is written.
+    #[test]
+    fn a_non_finite_float_in_a_context_is_refused() {
+        let key = WorkflowKey::new("report");
+        assert!(ScheduleSpec::for_workflow("nan", key.clone(), "0 * * * * *", &f64::NAN).is_err());
+        assert!(ScheduleSpec::for_workflow("ok", key, "0 * * * * *", &1.5f64).is_ok());
+
+        let input = ScheduledWorkflowInput {
+            scheduled_time: SystemTime::UNIX_EPOCH,
+            context: f64::INFINITY,
+        };
+        assert!(encode::<_, EngineOnly>(&input, &PayloadEncoding::Native, "argument").is_err());
+    }
+
     #[test]
     fn a_schedule_reads_back_everything_its_row_holds() {
         let schedule = Schedule::from_record(
@@ -1298,7 +1316,7 @@ mod tests {
             &Serializer::RustSerde,
         );
         assert_eq!(schedule.id(), "id-1");
-        assert_eq!(schedule.name(), "nightly");
+        assert_eq!(schedule.schedule_name(), "nightly");
         assert_eq!(
             schedule.workflow(),
             &WorkflowKey {
@@ -1318,7 +1336,7 @@ mod tests {
         assert!(schedule.automatic_backfill());
         assert_eq!(schedule.cron_timezone(), Some("Europe/Paris"));
         assert_eq!(schedule.queue_name(), Some("reports"));
-        assert_eq!(schedule.application_name(), Some("app"));
+        assert_eq!(schedule.app_name(), Some("app"));
     }
 
     /// JSON, reversed: text only this serializer reads.

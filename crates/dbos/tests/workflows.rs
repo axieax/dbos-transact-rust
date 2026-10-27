@@ -62,10 +62,46 @@ async fn a_workflow_runs_and_records_its_output() {
     assert_eq!(row.input.as_deref(), Some("21"));
     assert_eq!(row.serialization.as_deref(), Some("rust_serde"));
     assert_eq!(
-        row.application_version.as_deref(),
+        row.app_version.as_deref(),
         Some(&*dbos.app_version().unwrap())
     );
     assert_eq!(row.executor_id.as_deref(), Some("local"));
+
+    dbos.shutdown().await;
+}
+
+/// A value only the insert checks is refused as the start's argument too: to "start a workflow"
+/// for a start that names no queue, and with nothing written.
+#[tokio::test]
+async fn a_start_with_an_empty_workflow_id_is_refused_as_an_argument() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("empty-id-app", &db));
+    let double = dbos.register_workflow("double", double).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = double
+        .run_with(
+            21,
+            RunOptions {
+                workflow_id: Some(""),
+                ..RunOptions::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+            if operation == "start a workflow" && detail == "`workflow_id` must not be empty"),
+        "got {refused:?}"
+    );
+    assert!(
+        reader(&db)
+            .await
+            .list_workflows(&Default::default(), None)
+            .await
+            .expect("read failed")
+            .is_empty(),
+        "a refused start wrote a row"
+    );
 
     dbos.shutdown().await;
 }

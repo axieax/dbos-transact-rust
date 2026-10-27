@@ -45,22 +45,6 @@ pub enum Error {
         /// Which part disagreed, and how.
         detail: String,
     },
-    /// A second `recv` on a (workflow, topic) another is already waiting on.
-    ///
-    /// One message goes to one receiver, so a second waiter can only wait out its timeout and
-    /// report that nothing arrived — indistinguishable, to the workflow that sent it, from nothing
-    /// having been sent. Python and Go reject it too; both reuse their generic workflow-conflict
-    /// error, which this crate's [`ConflictingWorkflow`](Error::ConflictingWorkflow) is not — that
-    /// one says the workflow already exists, and here it existing is the premise.
-    ///
-    /// **In-process only.** Two receivers in different processes never meet, and are arbitrated at
-    /// the database instead, by the consuming `UPDATE` in `recv`.
-    ConcurrentRecv {
-        /// The workflow being received on, which is also the workflow calling.
-        workflow_id: String,
-        /// The topic, or `None` for the default one.
-        topic: Option<String>,
-    },
     /// A caller supplied a value the layer will not store.
     ///
     /// Distinct from [`Error::Malformed`], which is about values already *in* the database.
@@ -113,15 +97,27 @@ pub enum Error {
         /// The step recorded there.
         recorded: String,
     },
-    /// Another execution recorded this step first.
+    /// This execution recorded the step already, with a different result: its code isn't
+    /// deterministic.
     ///
-    /// Two executors believed they owned one workflow. Distinguished from this caller's own
-    /// retry by the completion timestamp, which a retry repeats and a rival does not.
-    StepAlreadyRecorded {
-        /// The workflow whose step was taken.
+    /// No other execution can have, since the owner check runs first in the same transaction
+    /// (when the caller presents its token). A retry of this caller's own write is told apart by
+    /// its completion time, which a retry repeats.
+    StepNondeterminism {
+        /// The workflow whose step was recorded twice.
         workflow_id: String,
         /// The position that was already filled.
         step_id: i32,
+    },
+    /// This execution no longer owns its workflow, so it must stop and wait for the owner's
+    /// outcome.
+    ///
+    /// The workflow was handed to another execution (cancelled, resumed, or recovered) and the
+    /// write that found out rolled back. Every write a workflow makes from inside its execution
+    /// checks first.
+    WorkflowConflict {
+        /// The workflow this execution no longer owns.
+        workflow_id: String,
     },
     /// A workflow has no step to fork from.
     ///
@@ -161,13 +157,6 @@ pub enum Error {
         workflow_id: String,
         /// The status the rewind read before the row moved.
         status: String,
-    },
-    /// The workflow has been recovered too many times and is now parked.
-    MaxRecoveryAttemptsExceeded {
-        /// The parked workflow.
-        workflow_id: String,
-        /// The limit it passed.
-        limit: i64,
     },
     /// A name is already registered by this same application.
     ///
@@ -220,13 +209,6 @@ impl std::fmt::Display for Error {
                 workflow_id,
                 detail,
             } => write!(f, "workflow {workflow_id} already exists: {detail}"),
-            Error::ConcurrentRecv { workflow_id, topic } => match topic {
-                Some(topic) => write!(
-                    f,
-                    "workflow {workflow_id} is already receiving on topic {topic}"
-                ),
-                None => write!(f, "workflow {workflow_id} is already receiving"),
-            },
             Error::InvalidInput { field, detail } => write!(f, "invalid {field}: {detail}"),
             Error::QueueDeduplicated {
                 workflow_id,
@@ -250,13 +232,20 @@ impl std::fmt::Display for Error {
                 "workflow {workflow_id} step {step_id} was recorded as {recorded:?}, \
                  but {expected:?} was expected"
             ),
-            Error::StepAlreadyRecorded {
+            Error::StepNondeterminism {
                 workflow_id,
                 step_id,
             } => write!(
                 f,
-                "workflow {workflow_id} step {step_id} was already recorded by another execution"
+                "step {step_id} of workflow {workflow_id} was recorded twice by the same \
+                 execution with different results; check that the workflow is deterministic"
             ),
+            Error::WorkflowConflict { workflow_id } => {
+                write!(
+                    f,
+                    "workflow {workflow_id} is no longer owned by this execution"
+                )
+            }
             Error::NoForkPoint {
                 workflow_ids,
                 step_name,
@@ -286,10 +275,6 @@ impl std::fmt::Display for Error {
                 f,
                 "workflow {workflow_id} changed status from {status} while being rewound; \
                  retry the rewind"
-            ),
-            Error::MaxRecoveryAttemptsExceeded { workflow_id, limit } => write!(
-                f,
-                "workflow {workflow_id} exceeded {limit} recovery attempts"
             ),
             // The remedy is in the message because there is no way to act on this from code:
             // whichever cause it is, a person has to choose a name or move the rows.
@@ -344,9 +329,8 @@ impl Error {
     ///   the fact, and a recorded failure would outlive the fix.
     /// - **A value this build cannot read.** That says something about the build rather than the
     ///   data; a later build may read it, and a recorded failure would outlive the fix.
-    /// - **Signals about the calling execution** — cancelled, superseded by a rival, or replaying
-    ///   code that has changed — which end the run rather than answer the call.
-    /// - **A second in-process receiver**, which is about this process, not the database.
+    /// - **Signals about the calling execution** — cancelled, no longer the workflow's owner, or
+    ///   replaying code that has changed — which end the run rather than answer the call.
     ///
     /// Exhaustive, so a new variant has to be placed on one side or the other.
     pub(crate) fn should_record(&self) -> bool {
@@ -355,9 +339,9 @@ impl Error {
             | Error::Malformed(_)
             | Error::UnknownSerialization { .. }
             | Error::WorkflowCancelled { .. }
-            | Error::StepAlreadyRecorded { .. }
-            | Error::UnexpectedStep { .. }
-            | Error::ConcurrentRecv { .. } => false,
+            | Error::StepNondeterminism { .. }
+            | Error::WorkflowConflict { .. }
+            | Error::UnexpectedStep { .. } => false,
             Error::ConflictingWorkflow { .. }
             | Error::InvalidInput { .. }
             | Error::QueueDeduplicated { .. }
@@ -365,7 +349,6 @@ impl Error {
             | Error::NonExistentWorkflow { .. }
             | Error::WorkflowNotRewindable { .. }
             | Error::RewindInterrupted { .. }
-            | Error::MaxRecoveryAttemptsExceeded { .. }
             | Error::AlreadyRegistered { .. }
             | Error::NotRegistered { .. }
             | Error::RegisteredByAnother { .. } => true,
@@ -481,9 +464,15 @@ mod tests {
             .should_record()
         );
         assert!(
-            !Error::StepAlreadyRecorded {
+            !Error::StepNondeterminism {
                 workflow_id: "wf".to_owned(),
                 step_id: 0,
+            }
+            .should_record()
+        );
+        assert!(
+            !Error::WorkflowConflict {
+                workflow_id: "wf".to_owned(),
             }
             .should_record()
         );

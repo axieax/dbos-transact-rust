@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -15,14 +15,15 @@ use tracing::Instrument;
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::error::{DurableError, EncodedError, Error, Failure, Result};
+use crate::error::{DurableError, EncodedError, Error, Failure, Result, refusal_detail};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
-    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
-    WorkflowInitResult,
+    AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
+    StepCaller, StepTiming, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
+    validate_positive_duration,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -236,7 +237,9 @@ pub struct RunOptions<'a> {
     /// wall-clock deadline stored on the row, so it survives a crash: a workflow recovered with
     /// two minutes left has two minutes, not the whole budget again. On expiry the row goes
     /// `CANCELLED` and callers awaiting it get [`Error::WorkflowCancelled`], which is what all four
-    /// references do.
+    /// references do. Every executor of the application sweeps for expired deadlines, so the row is
+    /// cancelled whether or not anything is running it: a queued workflow nobody has dequeued, or
+    /// one whose executor died, times out too.
     ///
     /// A step's [`timeout`](crate::StepOptions::timeout) bounds one attempt and is recorded as a
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
@@ -424,6 +427,10 @@ pub enum DuplicationPolicy {
     /// The default, and what every implementation defaults to. A caller who did not think about
     /// collisions should hear that the key was taken, rather than silently joining a workflow
     /// whose arguments are somebody else's.
+    ///
+    /// **Started from inside a workflow, the error is recorded at the parent's step**, so a replay
+    /// of the parent gets the same error and starts nothing, even once the holder has finished and
+    /// the key is free.
     #[default]
     Reject,
     /// Hand back a handle to the workflow already holding the key.
@@ -488,16 +495,18 @@ impl<'a> Enqueue<'a> {
     ///   accepting it would give that state a second spelling that reads like a real priority;
     ///   the references' documented range starts at 1 for the same reason. The ceiling is
     ///   [`i32::MAX`] because the column is a signed 32-bit integer.
+    /// - **A delay must be more than zero, and fit in milliseconds as a 64-bit integer.** A zero
+    ///   delay is a caller that meant `None`. Neither rule reads a clock, so a replay decides it as
+    ///   the first run did. A delay that fits but carries `now` past the largest instant is refused
+    ///   by the system database when it resolves the delay, and reported as the same
+    ///   [`Error::InvalidArgument`] by [`refused_start`]. The system database also refuses
+    ///   everything here again for its own callers.
     ///
-    /// Naming the queue in the message rather than only the field, because a start that fails
-    /// validation says nothing else about which enqueue it was.
+    /// Each is an [`Error::InvalidArgument`] to [`ENQUEUE_OPERATION`] naming the queue, through
+    /// [`start_refusal`].
     pub(crate) fn validate(&self) -> Result<()> {
-        let refuse = |message: String| {
-            Err(Error::Config(format!(
-                "enqueue onto `{}`: {message}",
-                self.name
-            )))
-        };
+        let refused = |message: String| start_refusal(Some(self.name), message);
+        let refuse = |message: String| Err(refused(message));
 
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
             && self.deduplication_id.is_none()
@@ -522,6 +531,13 @@ impl<'a> Enqueue<'a> {
                 ));
             }
         }
+        if let Some(delay) = self.delay {
+            validate_positive_duration("delay", delay).map_err(|error| {
+                Error::from_refusal(error, |field, detail| {
+                    refused(refusal_detail(field, &detail))
+                })
+            })?;
+        }
         Ok(())
     }
 
@@ -532,6 +548,93 @@ impl<'a> Enqueue<'a> {
     pub(crate) fn stored_priority(&self) -> i32 {
         self.priority.map_or(0, |priority| priority as i32)
     }
+}
+
+/// What a start that runs at once is refused as. A start onto a queue, and with it every client
+/// enqueue, is refused as [`ENQUEUE_OPERATION`].
+pub(crate) const START_OPERATION: &str = "start a workflow";
+
+/// What a start onto a queue is refused as; see [`START_OPERATION`].
+pub(crate) const ENQUEUE_OPERATION: &str = "enqueue a workflow";
+
+/// A start's refusal of one of its arguments: an [`Error::InvalidArgument`] to
+/// [`ENQUEUE_OPERATION`] when it names a queue, with the queue in the detail because nothing
+/// else in the refusal says which enqueue it was, and to [`START_OPERATION`] when it does not.
+fn start_refusal(queue: Option<&str>, detail: String) -> Error {
+    match queue {
+        Some(queue) => Error::InvalidArgument {
+            operation: ENQUEUE_OPERATION.into(),
+            detail: format!("queue `{queue}`: {detail}"),
+        },
+        None => Error::InvalidArgument {
+            operation: START_OPERATION.into(),
+            detail,
+        },
+    }
+}
+
+/// A start's error, with the system database's refusal of its arguments reported as the start's
+/// own, through [`start_refusal`].
+///
+/// Chiefly the refusal only the insert can make: a delay that fits in milliseconds but carries the
+/// release time past the largest instant, which depends on the clock. A child start records that
+/// refusal at its parent's step as the system database's error, so a replay reads it back in the
+/// same form and this maps it the same way. **The refusal is what replays; its wording is not
+/// recorded.** The operation and the queue in the detail come from the call making it, so a replay
+/// fails as the first run did, with the same variant, field and reason, and names its own queue if
+/// its options name a different one. Also every other value of the row the caller supplied
+/// and the insert refuses — an empty `workflow_id`, `deduplication_id` or `partition_key` — named
+/// as the start's API spells it, which is not always the column's name.
+pub(crate) fn refused_start(queue: Option<&str>, error: Error) -> Error {
+    match error {
+        Error::SystemDatabase(crate::sysdb::Error::InvalidInput { field, detail }) => {
+            start_refusal(queue, refusal_detail(api_field(&field), &detail))
+        }
+        other => other,
+    }
+}
+
+/// The name a start's API gives a column the system database refuses by name: the queue's
+/// [`name`](Enqueue::name) and [`partition_key`](Enqueue::partition_key), and a client's
+/// `workflow` and [`app_version`](crate::EnqueueOptions::app_version). Every other column is
+/// spelled as the API spells it.
+fn api_field(field: &str) -> &str {
+    match field {
+        "queue_name" => "name",
+        "queue_partition_key" => "partition_key",
+        "name" => "workflow",
+        "application_version" => "app_version",
+        other => other,
+    }
+}
+
+/// Refuses a start's arguments that no row could hold: its enqueue's, through
+/// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds. Each is
+/// an [`Error::InvalidArgument`], through [`start_refusal`].
+///
+/// The one check every surface that starts or enqueues a workflow makes before it writes
+/// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
+/// before they encode the input — so a refusal costs no row and no step id. None of it reads a
+/// clock, so a replay decides it as the first run did. The system database refuses the same
+/// values again for its own callers.
+pub(crate) fn validate_start(
+    enqueue: Option<&Enqueue<'_>>,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    if let Some(enqueue) = enqueue {
+        enqueue.validate()?;
+    }
+    if let Some(timeout) = timeout {
+        validate_positive_duration("timeout", timeout).map_err(|error| {
+            Error::from_refusal(error, |field, detail| {
+                start_refusal(
+                    enqueue.map(|enqueue| enqueue.name),
+                    refusal_detail(field, &detail),
+                )
+            })
+        })?;
+    }
+    Ok(())
 }
 
 /// A new workflow row with its queue-shaped half filled in: the five columns an [`Enqueue`]
@@ -615,8 +718,8 @@ impl OwnedEnqueue {
     ///
     /// An inherent `as_*` rather than [`AsRef`] or [`Borrow`](std::borrow::Borrow), which both
     /// have to hand back a reference: an [`Enqueue`] is a value *made* of references, so there is
-    /// nothing here to lend. `Encoded::as_message` in `message.rs` is the same shape for the same
-    /// reason.
+    /// nothing here to lend. `EncodedSendMessage::as_sysdb_message` in `message.rs` is the same
+    /// shape for the same reason.
     fn as_enqueue(&self) -> Enqueue<'_> {
         Enqueue {
             name: &self.name,
@@ -658,11 +761,7 @@ pub(crate) async fn init_or_join(
     caller: Option<InitWorkflowCaller<'_>>,
 ) -> Result<Submitted> {
     loop {
-        match conn
-            .sysdb()
-            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh, caller)
-            .await
-        {
+        match conn.sysdb().init_workflow(new, caller).await {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
             // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
@@ -795,9 +894,9 @@ impl Timeout {
     /// The budget to record on the row, which only [`Explicit`](Self::Explicit) has.
     ///
     /// Neither of the others is a budget: `Inherit` takes an *instant* from its parent and
-    /// `None` takes nothing, and a row's `workflow_timeout_ms` is what a **queue** recomputes
-    /// a deadline from on dequeue. Writing one for either would hand that path a budget the caller
-    /// never asked for.
+    /// `None` takes nothing, and a row's `workflow_timeout_ms` is what the database turns into a
+    /// deadline: the insert, for a workflow that starts now, and the dequeue's claim, for a queued
+    /// one. Writing one for either would hand those a budget the caller never asked for.
     fn budget(self) -> Option<Duration> {
         match self {
             Self::Explicit(timeout) => Some(timeout),
@@ -892,10 +991,9 @@ where
     /// reproduce it — so the half of a start that decides *where* it stands has to be a plain
     /// function, and only the half that writes rows may be deferred into the future.
     ///
-    /// **The two checks ahead of the placement are ahead of it on purpose**: a start refused for
-    /// its instance or its enqueue must move no counter, or the refusal shifts every later step
-    /// of the parent onto the wrong replay slot. `queue::validate` refuses a queue's own
-    /// configuration in the same spot, for the same reason it costs a round trip and not a row.
+    /// **The checks ahead of the placement are ahead of it on purpose**: a start refused for its
+    /// instance, its enqueue or its timeout must move no counter, or the refusal shifts every later step
+    /// of the parent onto the wrong replay slot.
     ///
     /// The placement itself is [`StepPlacement::of`]'s, shared with every other library step in
     /// the crate — including the await this start's [`run`](Self::run) pairs it with. Two of its
@@ -912,13 +1010,11 @@ where
     ///   instance's system database, landing where the workflow that allocated it cannot see it.
     ///   `get_event` refuses the same combination for the same reason.
     fn place(&self, options: &StartOptions<'_>) -> Result<StartPlacement> {
-        let executor = self.dbos().executor("start a workflow")?;
+        let executor = self.dbos().executor(START_OPERATION)?;
         // Borrowed rather than moved, because `options` is read again by the run, and **validated
         // before anything is written and before the counter moves**: an enqueue no queue could
         // honour should cost a round trip, not a row and not a step id.
-        if let Some(enqueue) = options.queue.as_ref() {
-            enqueue.validate()?;
-        }
+        validate_start(options.queue.as_ref(), options.timeout.budget())?;
         let placement = StepPlacement::of(executor.connection(), "starting a workflow")?;
         if matches!(placement, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
@@ -1094,6 +1190,11 @@ where
         // is derived from — and resolved *here* rather than in the task so that this call can name
         // the workflow whatever becomes of the task.
         let workflow_id = child_workflow_id(options.workflow_id, placed.parent().as_ref());
+        // Held by the task for as long as it exists, so a parent waits for its start before
+        // recording its outcome, and with it giving up the token the start writes under. See
+        // `Ctx::starts`. Taken before the spawn and moved into the task, so one aborted before its
+        // first poll still gives it back.
+        let tracked = placed.parent().map(|parent| parent.ctx.starts().token());
         let (executor, placement) = placed.into_parts();
         // The registration's choice, unless an enqueue makes its own, and the configured
         // serializer where neither does. A child does not inherit its parent's: what it is encoded
@@ -1122,9 +1223,14 @@ where
             request,
         )
         .instrument(tracing::Span::current());
+        let creating = async move {
+            let _tracked = tracked;
+            creating.await
+        };
 
+        let queue = options.queue.as_ref().map(|enqueue| enqueue.name);
         match spawn_tracked(&executor, creating).await {
-            Ok(started) => started,
+            Ok(started) => started.map_err(|error| refused_start(queue, error)),
             // Only shutdown aborts this task, and what the abort leaves behind depends on where
             // it landed. Before the transaction committed, nothing was written and the start did
             // not happen. After it, the child exists and is recorded against this parent — what
@@ -1203,10 +1309,10 @@ async fn create<R, E>(
     // outside one is unaffected by everything below.
     let parent = placed.parent();
 
-    // The launch is recorded against the parent before anything is created, so a replay of
-    // this position finds the child it already started instead of starting a second one.
+    // A replay of this position finds the child it already started, or the error its start
+    // returned, instead of trying the start again.
     if let Some(parent) = &parent
-        && let Some(child) = parent.recorded_child(executor, &key.name).await?
+        && let Some(child) = parent.check_child(executor, &key.name).await?
     {
         tracing::debug!(
             parent_workflow_id = parent.workflow_id(),
@@ -1224,33 +1330,20 @@ async fn create<R, E>(
         ));
     }
 
-    // **A directly started workflow gets its deadline now, and the row carries it.** Python
-    // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
-    // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
-    // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
-    // not another hour, and a crash loop cannot extend the budget indefinitely.
+    // **A deadline is written here only when it is inherited.** An explicit timeout is written as
+    // a budget, and the database turns it into a deadline on its own clock: the insert does, for a
+    // workflow that starts now, and the dequeue's claim does for a queued one, so the wait in the
+    // queue is not part of the budget. On the database's clock because every executor that later
+    // runs, recovers or sweeps the workflow compares against that clock, so a starter whose clock
+    // is off can neither shorten the budget nor stretch it. Persisting the deadline rather than
+    // recomputing it on recovery is the whole point of a durable timeout: a workflow given an hour
+    // that crashes after fifty minutes has ten left, not another hour.
     let deadline = match (timeout, &parent) {
-        // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
-        // explicit timeout records the budget and leaves the deadline null for the claim
-        // statement to fill in. The wait in the queue is not part of the budget — a workflow
-        // given five minutes that sits queued for an hour still gets five minutes. Python and
-        // TypeScript both branch on the queue in exactly this spot; the claim statement does
-        // the other half.
-        (Timeout::Explicit(_), _) if queue.is_some() => None,
-        // **An explicit timeout replaces an inherited deadline**, which is Python's and
-        // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
-        // use it over any propagated deadline"*. So a child given longer than its parent has
-        // left outlives its parent — an explicit timeout on a specific child is a statement
-        // about that child, and the alternative would silently ignore what the caller asked
-        // for. Go differs by taking the earlier of the two, but not by design: its deadline
-        // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets an
-        // explicitly *set* deadline win, and is not a model there — its user-facing `deadline`
-        // is Java's alone and Rust does not have one.
-        (Timeout::Explicit(timeout), _) => Timestamp::now().checked_add(timeout),
-        // **A deliberate refusal to inherit**, which is why the option is an enum: this is a
-        // caller who decided, and `Inherit` below is a caller who said nothing. Java's
-        // `Timeout.None` clears the propagated deadline in the same words.
-        (Timeout::None, _) => None,
+        // **An explicit timeout replaces an inherited deadline.** So a child given longer than its
+        // parent has left outlives its parent: an explicit timeout on a specific child is a
+        // statement about that child, and the alternative would silently ignore what the caller
+        // asked for. `Timeout::None` is a caller who decided not to inherit one either.
+        (Timeout::Explicit(_) | Timeout::None, _) => None,
         // **Inherited as an instant, not as a budget**, which is what makes it a deadline the
         // parent and the child genuinely share: both `select!`s fire at the same moment, in
         // different tasks and possibly in different processes, with no signal passing between
@@ -1275,9 +1368,9 @@ async fn create<R, E>(
         application_name: Some(executor.app_name()),
         application_version: Some(executor.app_version()),
         // Only a budget is written: an inherited deadline is an *instant* and has no
-        // budget behind it, and `Timeout::None` has neither. The column is what a
-        // queue recomputes a deadline from on dequeue, so filling it in for either
-        // would hand that path a budget nobody asked for.
+        // budget behind it, and `Timeout::None` has neither. The column is what the insert
+        // and a dequeue's claim compute a deadline from, so filling it in for either would
+        // hand them a budget nobody asked for.
         timeout: timeout.budget(),
         deadline,
         attributes: attributes.as_deref(),
@@ -1305,11 +1398,25 @@ async fn create<R, E>(
             // which records the joined case under the same one.
             step_name: &key.name,
             started_at,
+            owner_xid: parent.owner_xid(),
         }),
     )
-    .await?
+    .await
     {
-        Submitted::Created(initialized) => initialized,
+        Ok(Submitted::Created(initialized)) => initialized,
+        // **The start's error is recorded at the parent's step**, so a replay gets it too. See
+        // [`should_record_start_error`] for which errors, and why each one needs the record.
+        Err(Error::SystemDatabase(error)) if should_record_start_error(&error) => {
+            return Err(match &parent {
+                Some(parent) => {
+                    parent
+                        .record_start_error(executor, error, &key.name, started_at)
+                        .await
+                }
+                None => Error::SystemDatabase(error),
+            });
+        }
+        Err(error) => return Err(error),
         // **The start records the workflow that was joined**, not the id this call derived,
         // so a replay of this position resolves to the same workflow instead of trying to
         // start a child that was never created. Go records the same mapping at the same
@@ -1324,7 +1431,7 @@ async fn create<R, E>(
         // again. It joins the same holder if the key is still held, and starts a workflow of
         // its own if the holder has since finished — which is what the policy means at that
         // moment, since the key deduplicates a backlog rather than a history.
-        Submitted::Joined(holder) => {
+        Ok(Submitted::Joined(holder)) => {
             if let Some(parent) = &parent {
                 parent
                     .record_child(executor, &holder, &key.name, started_at)
@@ -1362,13 +1469,12 @@ async fn create<R, E>(
         ));
     }
 
-    // Someone else owns this row — the id was supplied and a previous run has it, or another
-    // executor claimed it first. Joining rather than erroring is what makes a retried request
-    // idempotent, and it is where Python waits too.
+    // Someone else created this row: the id was supplied and a previous call made it. Joining
+    // rather than erroring is what makes a retried request idempotent.
     if !initialized.should_execute {
         tracing::debug!(
             workflow_id,
-            "the workflow is already owned; the handle joins the existing run"
+            "another caller created the workflow; the handle joins it"
         );
         // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read this
         // row, and it is the case the references pass their own flag on — Python parks its unowned
@@ -1381,10 +1487,7 @@ async fn create<R, E>(
         ));
     }
 
-    // **The row's input and encoding, not this caller's.** A row this call found rather than
-    // created keeps the input and the tag it was written with, and a recovery of it would run
-    // those — so the run does too, rather than the input this caller offered and never wrote.
-    let input = initialized.existing_input.unwrap_or(input);
+    // The row's encoding, which is this caller's own: it created the row.
     let serialization = initialized.serialization;
     // The deadline the *database* holds, not the one this caller offered: `init_workflow`
     // turns a budget into an instant against its own clock, and an existing row keeps the
@@ -1393,9 +1496,11 @@ async fn create<R, E>(
         executor,
         key.clone(),
         workflow_id.clone(),
+        // The row was inserted `PENDING`, so its creator owns it from the start.
+        initialized.creator_xid,
         input,
         serialization,
-        initialized.deadline,
+        Deadline::of(initialized.deadline, initialized.clock),
         // A fresh start is not a dequeue, so it holds no queue's slot.
         None,
     );
@@ -1619,6 +1724,61 @@ impl StartPlacement {
     }
 }
 
+/// Whether a child start's `error` is recorded at the parent's step, so a replay gets the same
+/// error rather than trying the start again.
+///
+/// Each of these depends on another workflow's row, which can be gone by the time of a replay:
+///
+/// - [`QueueDeduplicated`](crate::sysdb::Error::QueueDeduplicated): the key is held only while its
+///   holder waits, so once the holder finishes the same start would go ahead.
+/// - [`ConflictingWorkflow`](crate::sysdb::Error::ConflictingWorkflow): the chosen child id names a
+///   workflow of another function, class or config, and once that row is deleted the same start
+///   would go ahead.
+///
+/// One more depends on the clock rather than on another row:
+///
+/// - [`InvalidInput`](crate::sysdb::Error::InvalidInput): a delay that fits in milliseconds but
+///   carries the release time past the largest instant a row can hold. Whether it does depends on
+///   when the start runs, so a replay on a host whose clock is behind could go ahead with it. The
+///   other `InvalidInput`s a start can reach depend only on its arguments, and recording one of
+///   those changes nothing, since the replay would refuse it the same way.
+///
+/// Without the record, the replay would start the child and the parent would take the other branch
+/// from the one it took after the error. Every other error a start can return is one of:
+///
+/// - an error that depends only on the start's own arguments, and so replays the same without a
+///   record;
+/// - database trouble, which a replay should meet afresh;
+/// - a signal about this execution (cancelled, superseded, replaying changed code), which ends the
+///   run rather than answering the start.
+fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
+    matches!(
+        error,
+        crate::sysdb::Error::QueueDeduplicated { .. }
+            | crate::sysdb::Error::ConflictingWorkflow { .. }
+            | crate::sysdb::Error::InvalidInput { .. }
+    )
+}
+
+/// The variants [`should_record_start_error`] accepts, by the name a recorded one is stored under.
+///
+/// A [`sysdb::Error`](crate::sysdb::Error) is stored as an object whose one key is its variant's
+/// name, so [`check_child`](Parent::check_child) can tell a recorded start error from a plain
+/// step's error by that key, before reading it as the type. A unit test keeps this list and the
+/// predicate in step.
+const RECORDED_START_ERRORS: [&str; 3] =
+    ["QueueDeduplicated", "ConflictingWorkflow", "InvalidInput"];
+
+/// Whether `value`, a recorded step error, has the shape of a recorded start error.
+fn is_recorded_start_error(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object
+                .keys()
+                .all(|key| RECORDED_START_ERRORS.contains(&key.as_str()))
+    })
+}
+
 /// The workflow a child is being started from: the context it runs in, and the step id the start
 /// occupies.
 ///
@@ -1637,6 +1797,12 @@ impl Parent<'_> {
         self.ctx.workflow_id()
     }
 
+    /// The token the parent's execution owns it by, which every write recording the start
+    /// presents: a parent that has been handed off starts nothing.
+    fn owner_xid(&self) -> &str {
+        self.ctx.owner_xid()
+    }
+
     /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
     fn deadline(&self) -> Option<Timestamp> {
         self.ctx.deadline()
@@ -1646,16 +1812,18 @@ impl Parent<'_> {
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
     /// [`UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this sees it. What is left
-    /// to check is the child id: a row under the right name carrying none was written by a plain
-    /// step, which means the parent's code changed — `step("charge")` became a child workflow
-    /// named `charge` — and starting a child now would give this position two meanings across
-    /// two runs.
+    /// is what the row holds:
     ///
-    /// **Stricter than the references here.** Python falls through to a fresh start when the
-    /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
-    /// up loud rather than wrong — the write conflicts a moment later — but only after a child row
-    /// has been created and orphaned, which is a worse thing to leave behind than an error.
-    async fn recorded_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
+    /// - **a child id**: the start went ahead, and the replay joins that child;
+    /// - **a recorded error**: the start failed, and the replay returns the same error without
+    ///   trying the start again. See [`record_start_error`](Self::record_start_error);
+    /// - **a recorded error this build can't decode**, or a recorded start error it can't read
+    ///   as one: the decode error, naming this step;
+    /// - **neither**, or an error that [`should_record_start_error`] doesn't name: a plain step
+    ///   wrote the row, which means the parent's code changed (`step("charge")` became a child
+    ///   workflow named `charge`), and starting a child now would give this position two meanings
+    ///   across two runs.
+    async fn check_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
         let Some(recorded) = executor
             .sysdb()
             .check_step(self.workflow_id(), self.step_id, step_name)
@@ -1664,14 +1832,108 @@ impl Parent<'_> {
         else {
             return Ok(None);
         };
-        recorded.child_workflow_id.map(Some).ok_or_else(|| {
-            Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
-                workflow_id: self.workflow_id().to_owned(),
+        if let Some(child) = recorded.child_workflow_id {
+            return Ok(Some(child));
+        }
+        if let Some(encoded) = recorded.error.as_deref() {
+            let caller = StepCaller {
+                workflow_id: self.workflow_id(),
                 step_id: self.step_id,
-                expected: format!("a child workflow start of {step_name}"),
-                recorded: format!("a plain step named {step_name}"),
-            })
-        })
+                codec: executor.serializer(),
+                owner_xid: self.owner_xid(),
+            };
+            let value: serde_json::Value =
+                decode_step_value(&recorded, encoded, caller, step_name, "an error")
+                    .map_err(Error::SystemDatabase)?;
+            // Told apart by shape before the typed read, so a start error this build can't read
+            // is reported as that, naming the step, rather than as a plain step's row.
+            if is_recorded_start_error(&value) {
+                let error = serde_json::from_value::<crate::sysdb::Error>(value).map_err(|e| {
+                    Error::SystemDatabase(crate::sysdb::Error::Malformed(format!(
+                        "workflow {} step {} ({step_name}) has an error this build cannot read: \
+                         {e}",
+                        self.workflow_id(),
+                        self.step_id,
+                    )))
+                })?;
+                tracing::debug!(
+                    parent_workflow_id = self.workflow_id(),
+                    step_id = self.step_id,
+                    %error,
+                    "the child workflow start failed; the replay returns the same error"
+                );
+                return Err(Error::SystemDatabase(error));
+            }
+        }
+        Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+            workflow_id: self.workflow_id().to_owned(),
+            step_id: self.step_id,
+            expected: format!("a child workflow start of {step_name}"),
+            recorded: format!("a plain step named {step_name}"),
+        }))
+    }
+
+    /// Records a failed start's error at this position, and gives back the error the caller
+    /// should see.
+    ///
+    /// The insert that failed wrote nothing, so the record goes in on its own. A crash before
+    /// it leaves nothing recorded and nothing observed, and the replay tries the start again as a
+    /// first run would.
+    ///
+    /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
+    ///   returns it again on a replay.
+    /// - **The record fails**: that failure is returned instead, and the position stays
+    ///   unrecorded, since the record is one transaction. A position recorded already is
+    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
+    ///   a parent no longer this execution's is
+    ///   [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict). Database trouble leaves the
+    ///   parent `PENDING` rather than ending it.
+    /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
+    ///   encoding failure is returned and the error logged, so the position stays unrecorded
+    ///   rather than the parent acting on an answer nothing recorded.
+    async fn record_start_error(
+        &self,
+        executor: &Executor,
+        error: crate::sysdb::Error,
+        step_name: &str,
+        started_at: Timestamp,
+    ) -> Error {
+        let recorded = match encode_step_value(&error, executor.serializer(), "an error") {
+            Ok(recorded) => recorded,
+            Err(encode_error) => {
+                tracing::warn!(
+                    parent_workflow_id = self.workflow_id(),
+                    step_id = self.step_id,
+                    %error,
+                    %encode_error,
+                    "the child workflow start failed, but its error could not be encoded \
+                     to record it"
+                );
+                return Error::SystemDatabase(encode_error);
+            }
+        };
+        // Read once, outside the retry inside `record_step`, so a retried write carries the same
+        // completion time and is recognised as this call's own.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+        match executor
+            .sysdb()
+            .record_step(
+                self.workflow_id(),
+                self.step_id,
+                step_name,
+                Outcome::Error(&recorded.value),
+                recorded.serialization.as_deref(),
+                Some(timing),
+                self.owner_xid(),
+            )
+            .await
+        {
+            Ok(()) => Error::SystemDatabase(error),
+            Err(record_error) => Error::SystemDatabase(record_error),
+        }
     }
 
     /// Records the start, so the replay above finds it — for the **joined** case alone.
@@ -1711,6 +1973,7 @@ impl Parent<'_> {
                 self.step_id,
                 step_name,
                 Some(started_at),
+                self.owner_xid(),
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -1731,13 +1994,18 @@ impl Parent<'_> {
 /// aborting it, without anything having to watch for the end. The one earlier release is an
 /// execution another one has overtaken, which [`adopt_superseded`] gives up before it waits. Every
 /// other submitter passes `None`.
+///
+/// `owner_xid` is the token the execution owns the workflow by: the creator token of a direct
+/// start that inserted the row, or the token of the claim that dequeued it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
     key: WorkflowKey,
     workflow_id: String,
+    owner_xid: String,
     input: Option<String>,
     serialization: Option<String>,
-    deadline: Option<Timestamp>,
+    deadline: Option<Deadline>,
     slot: Option<crate::dequeue::Slot>,
 ) -> tokio::task::JoinHandle<std::result::Result<EncodedOutput, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
@@ -1761,58 +2029,79 @@ pub(crate) fn spawn_execution(
                 let ctx = Ctx::new(
                     Arc::clone(&executor),
                     &workflow_id,
-                    deadline,
+                    owner_xid,
+                    deadline.map(|deadline| deadline.at),
                     encoding.clone(),
                 );
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, encoding, ctx, slot).await
+                execute(
+                    &executor,
+                    &key,
+                    &workflow_id,
+                    input,
+                    encoding,
+                    ctx,
+                    deadline.map(|deadline| deadline.expires),
+                    slot,
+                )
+                .await
             }
         }
         .instrument(span),
     )
 }
 
-/// Runs `body` until it finishes or its deadline passes, cancelling it durably if the deadline wins.
+/// A workflow's deadline, and when it passes on this process's monotonic clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    /// The instant the row holds, which the context carries for children to inherit.
+    at: Timestamp,
+    /// When the database's clock reaches `at`, measured from a reading of that clock, so the wait
+    /// doesn't depend on this host's wall clock agreeing with the database's.
+    expires: Instant,
+}
+
+impl Deadline {
+    /// A deadline the database set, timed from a reading of the database's clock: the one
+    /// `init_workflow` returned with it, or a dequeue's reading for its batch.
+    pub(crate) fn of(at: Option<Timestamp>, clock: DatabaseTime) -> Option<Self> {
+        at.map(|at| Self {
+            at,
+            expires: clock.reaches(at),
+        })
+    }
+}
+
+/// Runs `body` until it finishes or its deadline passes.
 ///
-/// **This is the engine's only durable-cancellation path, and shutdown deliberately does not go
-/// through it.** Go #426 had to fix exactly that confusion: its shutdown cancelled a context, the
-/// context fired the durable cancel hook, and workflows that should have stayed `PENDING` for
-/// recovery were written `CANCELLED` — inverting what shutdown means. Here the two use different
-/// mechanisms rather than a shared hook. A deadline is a branch of this `select!` that writes
-/// `CANCELLED` before returning; shutdown aborts the task outright, so no code of ours runs, no
-/// row is written, and the workflow is recovered. There is no cause to inspect because there is no
-/// single hook both reach, which is why this carries no cancellation-cause enum.
+/// The local timer is what interrupts a body blocked outside any step, which no durable check would
+/// reach. When it wins, the body is dropped and [`time_out`] records the timeout.
 ///
-/// The deadline is an *instant* rather than a budget, and that is what makes it survive a crash: a
-/// workflow recovered with two minutes left waits two minutes, not the whole timeout again. A
-/// deadline already in the past yields a zero wait and cancels at once, which is the correct
+/// **Shutdown deliberately doesn't go through here.** It aborts the task outright, so no code of
+/// ours runs and no row is written, and the workflow is recovered. The deadline and shutdown use
+/// different mechanisms rather than a shared hook, so there is no cancellation cause to inspect.
+///
+/// `expires` is when the database's clock reaches the deadline, on this process's monotonic clock
+/// (see [`DatabaseTime`]). The deadline is an *instant* rather than a budget, and that is what
+/// makes it survive a crash: a workflow recovered with two minutes left waits two minutes, not the
+/// whole timeout again. A deadline already in the past yields a zero wait, which is the correct
 /// reading of a workflow recovered after its expiry.
-async fn run_until_deadline<F>(
-    executor: &Executor,
-    workflow_id: &str,
-    deadline: Option<Timestamp>,
-    body: F,
-) -> Ended
+async fn run_until_deadline<F>(expires: Option<Instant>, body: F) -> Ended
 where
     F: Future<Output = std::result::Result<EncodedOutput, Failure>>,
 {
-    let Some(deadline) = deadline else {
+    let Some(expires) = expires else {
         return Ended::Body(body.await);
     };
-    let remaining = deadline
-        .duration_since(Timestamp::now())
-        .unwrap_or(Duration::ZERO);
 
     // Biased so a body that finished in the same instant keeps its outcome: it did complete, and
     // recording a completed workflow as cancelled would discard work that was actually done.
     tokio::select! {
         biased;
         outcome = body => Ended::Body(outcome),
-        () = tokio::time::sleep(remaining) => {
-            Ended::Terminal(cancel_at_deadline(executor, workflow_id).await)
-        }
+        () = tokio::time::sleep_until(expires.into()) => Ended::DeadlinePassed,
     }
 }
 
@@ -1820,69 +2109,58 @@ where
 enum Ended {
     /// The body ran to a conclusion. That conclusion is this execution's outcome and is written.
     Body(std::result::Result<EncodedOutput, Failure>),
-    /// The deadline fired and the row is already terminal — cancelled here, or finished by another
-    /// execution while this one was working. What it holds is the answer; nothing more is written.
-    Terminal(std::result::Result<EncodedOutput, Failure>),
+    /// The local timer fired and the body was dropped. What is left is to record the timeout.
+    DeadlinePassed,
 }
 
-/// Cancels a workflow whose deadline has passed, and settles on what the row ends up holding.
+/// Records the timeout of a workflow whose local timer fired, and settles on what the row holds.
 ///
-/// **`cancel_workflows` reports which ids actually moved, and that is the whole reason to read
-/// it.** `cancel_batch` leaves a workflow that has already finished alone, so an empty result here
-/// means a rival execution recorded an outcome first — recovery after this process was presumed
-/// dead, or another SDK sharing the system database. That outcome is the workflow's, and this
-/// caller must be told the same thing every other caller reads, not a cancellation that the row
-/// does not record and that `handle.status()` would immediately contradict.
-async fn cancel_at_deadline(
+/// **Cancelled only if the database's clock says the deadline has passed**, the same test the
+/// timeout sweep makes, and only while this execution still owns the workflow. The timer is measured on that clock, so the two normally agree; the test is
+/// what keeps a timer that fires a moment early, inside a reading's millisecond, from cancelling a
+/// workflow early.
+///
+/// Whatever the cancel finds, the outcome is what the row records: this cancel, or what settled the
+/// row first (the sweep, an explicit cancel, or another execution, including one resumed meanwhile,
+/// whose outcome this then waits for rather than overwrites). A row the cancel left unsettled is
+/// waited on until the sweep records its timeout.
+///
+/// The queue slot is given up first: the body is gone, and waiting here does no work a queue's
+/// concurrency limit should count.
+async fn time_out(
     executor: &Executor,
     workflow_id: &str,
+    owner_xid: &str,
+    slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
-    let cancelled = || {
-        Err(Failure::Control(Error::WorkflowCancelled {
-            workflow_id: workflow_id.to_owned(),
-        }))
-    };
-    tracing::info!(
-        workflow_id,
-        "the workflow exceeded its deadline and is cancelled"
-    );
-    // Durable, unlike every other stop this engine performs. Failing to write it is not fatal —
-    // the row stays PENDING and is recovered, where the expired deadline is read again and cancels
-    // immediately — so this logs rather than propagating, and still reports the cancellation it
-    // was unable to record.
-    // No caller, though this cancels a workflow that is running right here: the checkpoint
-    // argument records the cancel as a *step of the workflow that asked for it*, and the engine is
-    // not one. Spending a step id from this workflow's own counter would shift every step after it
-    // onto the wrong replay slot.
+    drop(slot);
     match executor
         .sysdb()
-        .cancel_workflows(&[workflow_id], false, None)
+        .cancel_if_timed_out(workflow_id, owner_xid)
         .await
     {
-        Ok(moved) if moved.iter().any(|id| id == workflow_id) => cancelled(),
-        Ok(_) => {
-            tracing::warn!(
+        Ok(true) => {
+            tracing::info!(
                 workflow_id,
-                "the deadline fired on a workflow another execution had already finished; its \
-                 recorded outcome stands"
+                "the workflow exceeded its deadline and is cancelled"
             );
-            // The cancel just read this row, so an absence now is a delete, not a race.
-            executor.connection().adopt(workflow_id, true).await
         }
+        Ok(false) => {}
         Err(error) => {
-            tracing::error!(
-                workflow_id,
-                %error,
-                "could not record the deadline cancellation; the row stays PENDING for recovery"
-            );
-            cancelled()
+            tracing::warn!(workflow_id, %error, "could not record the deadline cancellation");
         }
     }
+    // This execution read the row to run it, so an absence now is a delete, not a race.
+    executor.connection().adopt(workflow_id, true).await
 }
 
 /// Runs the body with a context ambient and records what it did.
 ///
-/// `slot` is the queue slot a dequeued execution holds, kept for as long as this runs.
+/// `expires` is when the context's deadline passes, on this process's monotonic clock: the
+/// deadline travels with the context, for the children it starts to inherit, and `expires` is the
+/// same instant measured from a reading of the database's clock. `slot` is the queue slot a
+/// dequeued execution holds, kept for as long as this runs.
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     executor: &Executor,
     key: &WorkflowKey,
@@ -1890,6 +2168,7 @@ async fn execute(
     input: Option<String>,
     encoding: PayloadEncoding,
     ctx: Ctx,
+    expires: Option<Instant>,
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
     let workflow = executor
@@ -1903,50 +2182,55 @@ async fn execute(
         .body
         .clone();
 
-    // From the context rather than from a parameter beside it: the deadline is part of what this
-    // workflow *is* for the whole of its run — a child launched halfway through reads the same
-    // value this `select!` is watching — so one copy travels with the context and nothing can hand
-    // the two halves different instants.
-    let deadline = ctx.deadline();
+    // Kept for the outcome write, which only lands while this execution still owns the workflow.
+    let owner_xid = ctx.owner_xid().to_owned();
+    let starts = ctx.starts().clone();
     let outcome = match run_until_deadline(
-        executor,
-        workflow_id,
-        deadline,
+        expires,
         Ctx::scope(ctx, async move {
-            let encoded = workflow(input, encoding.clone()).await?;
-            Ok(EncodedOutput { encoded, encoding })
+            let outcome = async {
+                let encoded = workflow(input, encoding.clone()).await?;
+                Ok(EncodedOutput { encoded, encoding })
+            }
+            .await;
+            // **A start the body dropped may still be writing under this execution's token**,
+            // which the outcome write gives up. Its write would then be refused with nobody
+            // awaiting it, and the child would never exist, so the outcome waits for every start
+            // the body began. Inside the deadline, so a start that stalls past it cannot hold the
+            // workflow open: the run times out as any other would, and a start refused after
+            // that is refused for a cancelled parent.
+            starts.drained().await;
+            outcome
         }),
     )
     .await
     {
         Ended::Body(outcome) => outcome,
-        // The row is terminal already — this execution has no outcome of its own to write, and a
-        // write behind the one that is there would be refused anyway.
-        Ended::Terminal(settled) => return settled,
+        Ended::DeadlinePassed => return time_out(executor, workflow_id, &owner_xid, slot).await,
     };
 
     let write = match &outcome {
         Ok(output) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Output(output.encoded.as_deref()))
+                .record_workflow_outcome(
+                    workflow_id,
+                    Outcome::Output(output.encoded.as_deref()),
+                    &owner_xid,
+                )
                 .await
         }
-        // Another execution checkpointed a step this one was about to, so it is ahead and this
-        // one is superseded — the same position as `OutcomeWrite::AlreadyFinished` below, one
-        // level down. The conflict is a fact about ownership, not a failure of the workflow, so
-        // the caller gets the outcome the winner records rather than an error for a workflow
-        // that may well succeed.
-        Err(Failure::Control(Error::SystemDatabase(
-            crate::sysdb::Error::StepAlreadyRecorded {
-                workflow_id: conflicted,
-                step_id,
-            },
-        ))) if conflicted == workflow_id => {
+        // A write was refused because the workflow was handed to another execution (cancelled,
+        // resumed, or recovered), so this one is superseded: the same position as
+        // `OutcomeWrite::AlreadyFinished` below, one level down. It is a fact about ownership,
+        // not a failure of the workflow, so the caller gets the outcome the owner records rather
+        // than an error for a workflow that may well succeed.
+        Err(Failure::Control(Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
+            workflow_id: conflicted,
+        }))) if conflicted == workflow_id => {
             tracing::warn!(
                 workflow_id,
-                step_id,
-                "another execution recorded this workflow's step first; waiting for its outcome"
+                "the workflow is no longer owned by this execution; waiting for the owner's outcome"
             );
             return adopt_superseded(executor, workflow_id, slot).await;
         }
@@ -1967,7 +2251,7 @@ async fn execute(
         Err(Failure::Recorded(recorded)) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded))
+                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded), &owner_xid)
                 .await
         }
     }
@@ -2090,6 +2374,134 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A delay or a timeout the row cannot hold is refused with the start's other argument
+    /// checks, which run before the start takes a step id.
+    #[test]
+    fn a_start_refuses_a_delay_or_timeout_the_row_cannot_hold() {
+        let fits = Duration::from_secs(3600);
+        assert!(
+            Enqueue {
+                delay: Some(fits),
+                ..Enqueue::new("q")
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(validate_start(None, Some(fits)).is_ok());
+        assert!(validate_start(None, None).is_ok());
+
+        let delay = Enqueue {
+            delay: Some(Duration::MAX),
+            ..Enqueue::new("q")
+        }
+        .validate();
+        assert!(
+            matches!(&delay, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION
+                    && detail == "queue `q`: `delay` must fit in milliseconds as a 64-bit integer"),
+            "got {delay:?}"
+        );
+        // Fits in milliseconds, and would carry now past the largest instant. That rule reads the
+        // clock, so it is not this check's: the system database applies it when it resolves the
+        // delay.
+        assert!(
+            Enqueue {
+                delay: Some(Duration::from_millis(i64::MAX as u64)),
+                ..Enqueue::new("q")
+            }
+            .validate()
+            .is_ok()
+        );
+        // The enqueue's own checks run through the same function.
+        let both = validate_start(
+            Some(&Enqueue {
+                delay: Some(Duration::ZERO),
+                ..Enqueue::new("q")
+            }),
+            Some(fits),
+        );
+        assert!(
+            matches!(&both, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION && detail.contains("`delay`")),
+            "got {both:?}"
+        );
+
+        // A queued start's timeout is the enqueue's argument, and names its queue.
+        let queued = validate_start(Some(&Enqueue::new("q")), Some(Duration::MAX));
+        assert!(
+            matches!(&queued, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION
+                    && detail == "queue `q`: `timeout` must fit in milliseconds as a 64-bit integer"),
+            "got {queued:?}"
+        );
+
+        let timeout = validate_start(None, Some(Duration::MAX));
+        assert!(
+            matches!(&timeout, Err(Error::InvalidArgument { operation, detail })
+                if operation == START_OPERATION
+                    && detail == "`timeout` must fit in milliseconds as a 64-bit integer"),
+            "got {timeout:?}"
+        );
+
+        // Zero is refused here too, with the system database's own wording, rather than once the
+        // start has taken its step id.
+        let delay = Enqueue {
+            delay: Some(Duration::ZERO),
+            ..Enqueue::new("q")
+        }
+        .validate();
+        assert!(
+            matches!(&delay, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION
+                    && detail == "queue `q`: `delay` must be a positive, non-zero duration"),
+            "got {delay:?}"
+        );
+        let timeout = validate_start(None, Some(Duration::ZERO));
+        assert!(
+            matches!(&timeout, Err(Error::InvalidArgument { operation, detail })
+                if operation == START_OPERATION
+                    && detail == "`timeout` must be a positive, non-zero duration"),
+            "got {timeout:?}"
+        );
+    }
+
+    /// The names [`check_child`](Parent::check_child) recognises a recorded start error by are the
+    /// variants [`should_record_start_error`] records, and no others.
+    #[test]
+    fn the_recorded_start_error_names_match_the_errors_that_are_recorded() {
+        let errors = [
+            crate::sysdb::Error::QueueDeduplicated {
+                workflow_id: "w".to_owned(),
+                queue_name: "q".to_owned(),
+                deduplication_id: "d".to_owned(),
+            },
+            crate::sysdb::Error::ConflictingWorkflow {
+                workflow_id: "w".to_owned(),
+                detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::InvalidInput {
+                field: "f".into(),
+                detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::NonExistentWorkflow {
+                workflow_ids: vec!["w".to_owned()],
+            },
+        ];
+        for error in &errors {
+            let value = serde_json::to_value(error).unwrap();
+            assert_eq!(
+                is_recorded_start_error(&value),
+                should_record_start_error(error),
+                "{value}"
+            );
+        }
+        let recorded = errors
+            .iter()
+            .filter(|error| should_record_start_error(error))
+            .count();
+        assert_eq!(recorded, RECORDED_START_ERRORS.len());
+    }
 
     /// A subscriber that keeps every event's level and message, and nothing else.
     ///
@@ -2253,6 +2665,7 @@ mod tests {
             Ctx::new(
                 Arc::clone(&executor),
                 "wf-donor",
+                crate::context::TEST_OWNER,
                 None,
                 crate::serialization::PayloadEncoding::Native,
             ),
@@ -2264,6 +2677,7 @@ mod tests {
         let thief = Ctx::new(
             Arc::clone(&executor),
             "wf-thief",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );

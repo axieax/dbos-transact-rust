@@ -5,6 +5,7 @@
 //! row that matches here is one the other SDKs read.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +14,8 @@ use serde_json::{Map, Value, json};
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
     PortableWorkflowArgs, QueueConflict, QueueOptions, ScheduleSpec, ScheduledWorkflowInput,
-    SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
-    WriteStreamOptions,
+    SendMessage, SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey,
+    WorkflowOptions, WriteStreamOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -185,13 +186,17 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
         .unwrap();
     client
         .send_with(
-            handle.workflow_id(),
-            &InteropMessage {
-                sender: "test".to_owned(),
-                payload: vec![1, 2, 3],
+            SendMessage {
+                topic: Some("interop_topic"),
+                ..SendMessage::new(
+                    handle.workflow_id(),
+                    &InteropMessage {
+                        sender: "test".to_owned(),
+                        payload: vec![1, 2, 3],
+                    },
+                )
             },
             SendOptions {
-                topic: Some("interop_topic"),
                 serialization: SerializationFormat::Portable,
                 ..Default::default()
             },
@@ -824,17 +829,13 @@ async fn insert_row(
     .unwrap();
 }
 
-/// A start that finds a row already written in another encoding runs what the row holds, by the
-/// row's tag — not the input it was called with, which it encoded differently.
+/// A row already written in another encoding runs what the row holds, by the row's tag — not the
+/// input a later start was called with, which it encoded differently. The row is a crash's
+/// leftover, so the launch's recovery runs it; the start finds the row and runs nothing of its own.
 #[tokio::test]
 async fn a_start_of_an_existing_row_runs_it_in_its_own_encoding() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("portable-restart", &db));
-    let echo = dbos
-        .register_workflow("echo", |text: String| async move { Ok::<_, Error>(text) })
-        .unwrap();
-    dbos.launch().await.expect("launch failed");
-    // Pending and unowned, as a row whose first run never got going: the start below claims it.
+    let config = config("portable-restart", &db);
     insert_row(
         &db,
         "wf-restart",
@@ -844,6 +845,23 @@ async fn a_start_of_an_existing_row_runs_it_in_its_own_encoding() {
         "portable_json",
     )
     .await;
+    // Pending under this executor and version, as a run that crashed before its first step.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status"
+             SET executor_id = 'local', application_version = $2
+           WHERE workflow_uuid = $1"#,
+    )
+    .bind("wf-restart")
+    .bind(config.app_version.as_deref())
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+
+    let dbos = DBOS::new(config);
+    let echo = dbos
+        .register_workflow("echo", |text: String| async move { Ok::<_, Error>(text) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
 
     let handle = echo
         .start_with(
@@ -938,4 +956,176 @@ async fn a_value_in_an_unknown_encoding_is_refused() {
         matches!(&error, Error::UnknownSerialization { name } if name == "py_pickle"),
         "{error:?}"
     );
+}
+
+/// **A result portable JSON cannot hold is the workflow's error.** A non-finite float has no
+/// portable spelling, so the result is refused; the refusal is recorded as the envelope of
+/// [`Error::Serialization`], the row ends ERROR, and a replay of the same id reads it back without
+/// running the body again.
+#[tokio::test]
+async fn a_result_portable_json_cannot_hold_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("portable-unencodable", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let not_a_number = dbos
+        .register_workflow_with(WorkflowKey::new("not_a_number"), portable(), {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<f64, Error>(f64::NAN) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    const REFUSAL: &str = "NaN is not a finite number, and portable JSON has no way to store one";
+    let refused = |error: &Error| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. } if what == "result" && message == REFUSAL
+        )
+    };
+
+    let handle = not_a_number.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(
+        scalar(
+            &db,
+            r#"SELECT status FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+            &id
+        )
+        .await
+        .as_deref(),
+        Some("ERROR")
+    );
+    let recorded: Value = serde_json::from_str(
+        &scalar(
+            &db,
+            r#"SELECT error FROM "dbos"."workflow_output" WHERE workflow_uuid = $1"#,
+            &id,
+        )
+        .await
+        .expect("an error is recorded"),
+    )
+    .expect("the error is JSON");
+    assert_eq!(
+        recorded,
+        json!({
+            "name": "dbos::Serialization",
+            "message": format!("could not serialize the workflow result: {REFUSAL}"),
+            "code": null,
+            "data": {"what": "result", "message": REFUSAL},
+        })
+    );
+
+    let replayed = not_a_number
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
+}
+
+/// An application error whose fields portable JSON cannot write: no JSON object has a non-string
+/// key.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+#[error("no keys fit")]
+struct BadKeys {
+    by_pair: std::collections::BTreeMap<(u8, u8), u8>,
+}
+
+/// **An error portable JSON cannot write is recorded as the refusal**, as the envelope of
+/// [`Error::Serialization`] carrying what the error displayed, so the row ends ERROR; the caller
+/// and a replay of the same id read it back without the body running again.
+#[tokio::test]
+async fn an_error_portable_json_cannot_write_is_recorded_as_the_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("portable-unencodable-error", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let bad_keys = dbos
+        .register_workflow_with(WorkflowKey::new("bad_keys"), portable(), {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<(), _>(Error::Application(BadKeys {
+                        by_pair: [((1, 2), 3)].into_iter().collect(),
+                    }))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error<BadKeys>| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "error"
+                    && message.contains("key must be a string")
+                    && message.contains("no keys fit")
+        )
+    };
+
+    let handle = bad_keys.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(
+        scalar(
+            &db,
+            r#"SELECT status FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+            &id
+        )
+        .await
+        .as_deref(),
+        Some("ERROR")
+    );
+    let recorded: Value = serde_json::from_str(
+        &scalar(
+            &db,
+            r#"SELECT error FROM "dbos"."workflow_output" WHERE workflow_uuid = $1"#,
+            &id,
+        )
+        .await
+        .expect("an error is recorded"),
+    )
+    .expect("the error is JSON");
+    assert_eq!(recorded["name"], "dbos::Serialization", "{recorded}");
+    assert_eq!(recorded["data"]["what"], "error", "{recorded}");
+
+    let replayed = bad_keys
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
 }

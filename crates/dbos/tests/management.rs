@@ -5,7 +5,7 @@
 //! the two listings are reads and writes against the row itself, and are checked against the
 //! system database directly.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
 use dbos::{
-    Children, Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, Error, ForkOptions,
+    Children, Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, Error, Fork, ForkOptions,
     ListWorkflowStepsOptions, ResumeOptions, StartOptions,
 };
 
@@ -212,11 +212,12 @@ async fn a_fork_takes_the_id_and_queue_it_is_given() {
 
     let forked = dbos
         .fork_with::<u32, EngineOnly>(
-            id,
-            0,
-            ForkOptions {
+            Fork {
                 forked_id: Some("the-fork"),
-                queue: Some("forks"),
+                ..Fork::new(id, 0)
+            },
+            ForkOptions {
+                queue_name: Some("forks"),
                 ..ForkOptions::default()
             },
         )
@@ -288,11 +289,12 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
 
     // Enqueued first, so it has had every sweep the keyed fork had.
     dbos.fork_with::<u32, EngineOnly>(
-        id,
-        0,
-        ForkOptions {
+        Fork {
             forked_id: Some("unkeyed-fork"),
-            queue: Some("partitioned-forks"),
+            ..Fork::new(id, 0)
+        },
+        ForkOptions {
+            queue_name: Some("partitioned-forks"),
             ..ForkOptions::default()
         },
     )
@@ -301,11 +303,12 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
 
     let keyed = dbos
         .fork_with::<u32, EngineOnly>(
-            id,
-            0,
-            ForkOptions {
+            Fork {
                 forked_id: Some("keyed-fork"),
-                queue: Some("partitioned-forks"),
+                ..Fork::new(id, 0)
+            },
+            ForkOptions {
+                queue_name: Some("partitioned-forks"),
                 queue_partition_key: Some("tenant-a"),
                 ..ForkOptions::default()
             },
@@ -422,6 +425,239 @@ async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
     dbos.shutdown().await;
 }
 
+/// **A fork can adopt a replacement for a child that failed.**
+///
+/// The parent runs a child, which fails, failing the parent. The child is re-run as a fork of
+/// itself, which succeeds. The parent is then forked from the step that awaits the child, mapping
+/// the failed child to its replacement: the copied start step names the replacement, so the fork
+/// waits on it and finishes with its result. Neither the parent's earlier step nor either child
+/// runs again.
+///
+/// Without the map, or with a map naming a child the parent never started, the same fork waits
+/// on the original child and fails with it. The client's fork takes the map too, and `fork_all`
+/// applies it to every fork in the batch. A map naming a child twice, or holding an empty id, is
+/// refused.
+#[tokio::test]
+async fn a_fork_adopts_the_replacement_for_a_failed_child() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("fork-replace-child-app", &db));
+    let broken = Arc::new(AtomicBool::new(true));
+    let (child_runs, before_runs) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let child = dbos
+        .register_workflow("child", {
+            let (broken, child_runs) = (Arc::clone(&broken), Arc::clone(&child_runs));
+            move |()| {
+                let (broken, child_runs) = (Arc::clone(&broken), Arc::clone(&child_runs));
+                async move {
+                    child_runs.fetch_add(1, Ordering::SeqCst);
+                    if broken.load(Ordering::SeqCst) {
+                        return Err(Error::Portable {
+                            name: "Broken".to_owned(),
+                            message: "the child is broken".to_owned(),
+                            code: None,
+                            data: None,
+                        });
+                    }
+                    Ok::<u32, Error>(42)
+                }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let before_runs = Arc::clone(&before_runs);
+            move |()| {
+                let (child, before_runs) = (child.clone(), Arc::clone(&before_runs));
+                async move {
+                    dbos::step("before", || async {
+                        before_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), Error>(())
+                    })
+                    .await?;
+                    // Step 1 starts the child, step 2 awaits it.
+                    let value = child.run(()).await?;
+                    Ok::<u32, Error>(value + 1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "replace-parent";
+    let original_child = "replace-parent-1";
+    parent
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the child fails the parent");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 1);
+    // A second parent, whose child fails the same way, for `fork_all` below.
+    let other_id = "replace-other-parent";
+    let other_child = "replace-other-parent-1";
+    parent
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(other_id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the child fails the parent");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 2);
+
+    broken.store(false, Ordering::SeqCst);
+    let replacement = dbos
+        .fork_with::<u32, EngineOnly>(
+            Fork {
+                forked_id: Some("replacement-child"),
+                ..Fork::new(original_child, 0)
+            },
+            ForkOptions::default(),
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        replacement.result().await.expect("the replacement failed"),
+        42
+    );
+    assert_eq!(child_runs.load(Ordering::SeqCst), 3);
+
+    let map = [(original_child, "replacement-child")];
+    let adopted = dbos
+        .fork_with::<u32, EngineOnly>(
+            Fork::new(id, 2),
+            ForkOptions {
+                replacement_children: &map,
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(adopted.result().await.expect("the fork failed"), 43);
+
+    let client = Client::connect(ClientConfig {
+        app_name: Some("fork-replace-child-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+    let by_client = client
+        .fork_with::<u32, EngineOnly>(
+            Fork::new(id, 2),
+            ForkOptions {
+                replacement_children: &map,
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(by_client.result().await.expect("the fork failed"), 43);
+
+    // One map for the whole batch: each parent adopts the replacement for its own child.
+    let both = [
+        (original_child, "replacement-child"),
+        (other_child, "replacement-child"),
+    ];
+    let batch = dbos
+        .fork_all::<u32, EngineOnly>(
+            &[Fork::new(id, 2), Fork::new(other_id, 2)],
+            ForkOptions {
+                replacement_children: &both,
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork_all failed");
+    assert_eq!(batch.len(), 2);
+    for fork in batch {
+        assert_eq!(fork.result().await.expect("a fork in the batch failed"), 43);
+    }
+
+    assert_eq!(before_runs.load(Ordering::SeqCst), 2, "step 0 ran again");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 3, "a child ran again");
+
+    // A child named twice, or an empty id on either side, is refused before anything is forked.
+    let twice = [
+        (original_child, "replacement-child"),
+        (original_child, "replace-other-parent-1"),
+    ];
+    let no_original = [("", "replacement-child")];
+    let no_replacement = [(original_child, "")];
+    for replacement_children in [&twice[..], &no_original[..], &no_replacement[..]] {
+        let fork = Fork {
+            forked_id: Some("refused-fork"),
+            ..Fork::new(id, 2)
+        };
+        let options = || ForkOptions {
+            replacement_children,
+            ..ForkOptions::default()
+        };
+        let refused = |result: dbos::Result<_>| {
+            matches!(
+                result,
+                Err(Error::InvalidArgument { ref detail, .. })
+                    if detail.contains("ForkOptions::replacement_children")
+            )
+        };
+        assert!(
+            refused(
+                dbos.fork_with::<u32, EngineOnly>(fork, options())
+                    .await
+                    .map(drop)
+            ),
+            "{replacement_children:?}"
+        );
+        assert!(
+            refused(
+                client
+                    .fork_with::<u32, EngineOnly>(fork, options())
+                    .await
+                    .map(drop)
+            ),
+            "{replacement_children:?}"
+        );
+    }
+    assert!(
+        client
+            .workflow_status("refused-fork")
+            .await
+            .expect("status read failed")
+            .is_none(),
+        "a refused fork was written"
+    );
+
+    // Without the map, and with a map naming a child that was never started, the fork waits on
+    // the original child and fails with it.
+    let unrelated = [("never-started", "replacement-child")];
+    for replacement_children in [&[][..], &unrelated[..]] {
+        let plain = dbos
+            .fork_with::<u32, EngineOnly>(
+                Fork::new(id, 2),
+                ForkOptions {
+                    replacement_children,
+                    ..ForkOptions::default()
+                },
+            )
+            .await
+            .expect("fork failed");
+        let error = plain
+            .result()
+            .await
+            .expect_err("the original child's failure");
+        assert!(error.to_string().contains("broken"), "{error}");
+    }
+    assert_eq!(child_runs.load(Ordering::SeqCst), 3, "a child ran again");
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
 /// Nothing on this surface is available before launch — the reads no more than the writes, since
 /// every one of them needs the system database the launch opens.
 #[tokio::test]
@@ -453,22 +689,15 @@ async fn the_management_surface_needs_a_launched_instance() {
     );
     refused!(
         "forked workflows",
-        dbos.fork_all::<u32, EngineOnly>(&["x"], 0, ForkOptions::default())
+        dbos.fork_all::<u32, EngineOnly>(&[Fork::new("x", 0)], ForkOptions::default())
             .await
     );
-    // The launch check outranks the option check, so a call that is wrong in both ways still
+    // The launch check outranks the argument check, so a call that is wrong in both ways still
     // reports the launch.
     refused!(
-        "forked workflows with an id it should have refused",
-        dbos.fork_all::<u32, EngineOnly>(
-            &["x"],
-            0,
-            ForkOptions {
-                forked_id: Some("one-id-for-many"),
-                ..ForkOptions::default()
-            },
-        )
-        .await
+        "forked workflows from a step it should have refused",
+        dbos.fork_all::<u32, EngineOnly>(&[Fork::new("x", -1)], ForkOptions::default())
+            .await
     );
     refused!("cancelled a workflow", dbos.cancel("x").await);
     refused!(
@@ -1059,7 +1288,7 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     // From the top rather than from either source's history: neither recorded a step, and the
     // count below is what says the bodies ran again.
     let forks = dbos
-        .fork_all::<u32, EngineOnly>(&ids, 0, ForkOptions::default())
+        .fork_all::<u32, EngineOnly>(&ids.map(|id| Fork::new(id, 0)), ForkOptions::default())
         .await
         .expect("bulk fork failed");
     assert_eq!(forks.len(), 2);
@@ -1075,40 +1304,79 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     dbos.shutdown().await;
 }
 
-/// One id cannot name many forks, so asking for one in the bulk form is refused rather than
-/// quietly ignored — whatever the step, since the objection is the batch.
+/// **A bulk fork names each fork and restarts each at its own step**, in one call.
+///
+/// Each source records two steps. One is forked from the top under a chosen id, the other from its
+/// second step under another; the handles come back under the ids asked for, in the order given,
+/// and the step counts show where each fork restarted.
 #[tokio::test]
-async fn forking_in_bulk_refuses_a_chosen_id() {
+async fn forking_in_bulk_names_each_fork_and_its_step() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("bulk-fork-id-app", &db));
+    let dbos = DBOS::new(config("bulk-fork-spec-app", &db));
+    let first_runs = Arc::new(AtomicU32::new(0));
+    let second_runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("two_steps", {
+            let (first_runs, second_runs) = (Arc::clone(&first_runs), Arc::clone(&second_runs));
+            move |()| {
+                let (first_runs, second_runs) = (Arc::clone(&first_runs), Arc::clone(&second_runs));
+                async move {
+                    let first = dbos::step("first", || async {
+                        first_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok::<u32, Error>(1)
+                    })
+                    .await?;
+                    let second = dbos::step("second", || async {
+                        second_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok::<u32, Error>(2)
+                    })
+                    .await?;
+                    Ok::<u32, Error>(first + second)
+                }
+            }
+        })
+        .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    let error = dbos
-        .fork_all::<u32, EngineOnly>(
-            &["a", "b"],
-            0,
-            ForkOptions {
-                forked_id: Some("the-only-one"),
-                ..ForkOptions::default()
-            },
-        )
-        .await
-        .expect_err("a chosen id was accepted for a batch");
-    assert!(
-        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
-        "expected a configuration refusal, got {error:?}"
-    );
+    for id in ["spec-source-a", "spec-source-b"] {
+        workflow
+            .run_with(
+                (),
+                dbos::RunOptions {
+                    workflow_id: Some(id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the source failed");
+    }
+    assert_eq!(first_runs.load(Ordering::SeqCst), 2);
+    assert_eq!(second_runs.load(Ordering::SeqCst), 2);
 
-    // Refused before the ids are looked at: neither `a` nor `b` has a row.
-    assert!(
-        reader(&db)
-            .await
-            .get_workflow("the-only-one")
-            .await
-            .expect("read failed")
-            .is_none(),
-        "a fork was written under the refused id",
+    let forks = [
+        Fork {
+            forked_id: Some("spec-fork-a"),
+            ..Fork::new("spec-source-a", 0)
+        },
+        Fork {
+            forked_id: Some("spec-fork-b"),
+            ..Fork::new("spec-source-b", 1)
+        },
+    ];
+    let handles = dbos
+        .fork_all::<u32, EngineOnly>(&forks, ForkOptions::default())
+        .await
+        .expect("bulk fork failed");
+    assert_eq!(
+        handles.iter().map(|h| h.workflow_id()).collect::<Vec<_>>(),
+        ["spec-fork-a", "spec-fork-b"],
     );
+    for handle in handles {
+        assert_eq!(handle.result().await.expect("a fork failed"), 3);
+    }
+    // The fork from the top ran both steps again; the one from step 1 replayed the first.
+    assert_eq!(first_runs.load(Ordering::SeqCst), 3);
+    assert_eq!(second_runs.load(Ordering::SeqCst), 4);
 
     dbos.shutdown().await;
 }
@@ -1140,12 +1408,11 @@ async fn forking_from_a_negative_step_is_refused() {
 
     let error = dbos
         .fork_with::<u32, EngineOnly>(
-            id,
-            -1,
-            ForkOptions {
+            Fork {
                 forked_id: Some("chosen"),
-                ..ForkOptions::default()
+                ..Fork::new(id, -1)
             },
+            ForkOptions::default(),
         )
         .await
         .expect_err("a negative step was accepted");
@@ -1153,12 +1420,22 @@ async fn forking_from_a_negative_step_is_refused() {
         matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
         "{error:?}"
     );
+    // One bad fork refuses the batch, the valid one beside it included, and the refusal names
+    // the fork that was wrong and the step it gave.
     let error = dbos
-        .fork_all::<u32, EngineOnly>(&[id], -1, ForkOptions::default())
+        .fork_all::<u32, EngineOnly>(
+            &[Fork::new(id, 0), Fork::new("another-source", -1)],
+            ForkOptions::default(),
+        )
         .await
         .expect_err("a negative step was accepted in bulk");
     assert!(
-        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
+        matches!(
+            &error,
+            Error::InvalidArgument { detail, .. }
+                if detail.contains("Fork::start_step of `another-source`")
+                    && detail.contains("got -1")
+        ),
         "{error:?}"
     );
 
@@ -1181,6 +1458,145 @@ async fn forking_from_a_negative_step_is_refused() {
             .was_forked_from,
         "a refused call forked the source",
     );
+
+    dbos.shutdown().await;
+}
+
+/// **A batch is checked as a whole before anything is written.** Two forks naming one id, an empty
+/// forked id, an empty original id, a forked id that is an original in the batch, and an option
+/// given as an empty string are each refused with `InvalidArgument`, the valid forks beside them
+/// included, and no workflow is written.
+#[tokio::test]
+async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("invalid-bulk-fork-app", &db));
+    let workflow = dbos
+        .register_workflow("forkable", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let sources = ["invalid-bulk-a", "invalid-bulk-b"];
+    for id in sources {
+        workflow
+            .run_with(
+                (),
+                dbos::RunOptions {
+                    workflow_id: Some(id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the source failed");
+    }
+    let reader = reader(&db).await;
+    let workflows = || async {
+        reader
+            .list_workflows(&WorkflowFilter::default(), None)
+            .await
+            .expect("read failed")
+            .len()
+    };
+    let before = workflows().await;
+
+    let duplicated = [
+        Fork {
+            forked_id: Some("one-id-twice"),
+            ..Fork::new(sources[0], 0)
+        },
+        Fork {
+            forked_id: Some("one-id-twice"),
+            ..Fork::new(sources[1], 0)
+        },
+    ];
+    let empty_forked_id = [
+        Fork::new(sources[0], 0),
+        Fork {
+            forked_id: Some(""),
+            ..Fork::new(sources[1], 0)
+        },
+    ];
+    let empty_original_id = [Fork::new(sources[0], 0), Fork::new("", 0)];
+    // A forked id that is an original in the batch, its own fork's or another's, is certain to
+    // collide with that original's row.
+    let onto_own_original = [Fork {
+        forked_id: Some(sources[0]),
+        ..Fork::new(sources[0], 0)
+    }];
+    let onto_other_original = [
+        Fork::new(sources[0], 0),
+        Fork {
+            forked_id: Some(sources[0]),
+            ..Fork::new(sources[1], 0)
+        },
+    ];
+    for (forks, mentions) in [
+        (&duplicated[..], "one-id-twice"),
+        (&empty_forked_id[..], "Fork::forked_id of `invalid-bulk-b`"),
+        (&empty_original_id[..], "original_id"),
+        (&onto_own_original[..], sources[0]),
+        (&onto_other_original[..], sources[0]),
+    ] {
+        let error = dbos
+            .fork_all::<u32, EngineOnly>(forks, ForkOptions::default())
+            .await
+            .expect_err("an invalid batch was accepted");
+        assert!(
+            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains(mentions)),
+            "{forks:?}: {error:?}"
+        );
+    }
+
+    // An option given as an empty string refuses a batch of valid forks.
+    let valid = sources.map(|id| Fork::new(id, 0));
+    for (options, mentions) in [
+        (
+            ForkOptions {
+                app_version: Some(""),
+                ..ForkOptions::default()
+            },
+            "ForkOptions::app_version",
+        ),
+        (
+            ForkOptions {
+                queue_name: Some(""),
+                ..ForkOptions::default()
+            },
+            "ForkOptions::queue_name",
+        ),
+        (
+            ForkOptions {
+                queue_partition_key: Some(""),
+                ..ForkOptions::default()
+            },
+            "ForkOptions::queue_partition_key",
+        ),
+    ] {
+        let error = dbos
+            .fork_all::<u32, EngineOnly>(&valid, options)
+            .await
+            .expect_err("an empty option was accepted");
+        assert!(
+            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains(mentions)),
+            "{options:?}: {error:?}"
+        );
+    }
+
+    assert_eq!(
+        workflows().await,
+        before,
+        "a refused batch wrote a workflow"
+    );
+    for id in sources {
+        assert!(
+            !reader
+                .get_workflow(id)
+                .await
+                .expect("read failed")
+                .expect("the source is gone")
+                .was_forked_from,
+            "a refused batch forked {id}",
+        );
+    }
 
     dbos.shutdown().await;
 }
@@ -1224,7 +1640,7 @@ async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
         .resume_with::<u32, EngineOnly>(
             id,
             ResumeOptions {
-                queue: Some("recovery"),
+                queue_name: Some("recovery"),
             },
         )
         .await
@@ -1658,7 +2074,7 @@ async fn a_management_checkpoint_is_in_the_configured_serializer_and_replays_by_
 async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
     let db = test_database().await;
     let reader = reader(&db).await;
-    let source_id = "the-source";
+    let original_id = "the-source";
     let operator_id = "the-forker";
 
     let forks_of_source = || async {
@@ -1667,7 +2083,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
             .await
             .expect("read failed")
             .into_iter()
-            .filter(|row| row.forked_from.as_deref() == Some(source_id))
+            .filter(|row| row.forked_from.as_deref() == Some(original_id))
             .map(|row| row.workflow_id)
             .collect();
         ids.sort();
@@ -1702,7 +2118,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
             .run_with(
                 (),
                 dbos::RunOptions {
-                    workflow_id: Some(source_id),
+                    workflow_id: Some(original_id),
                     ..Default::default()
                 },
             )
@@ -1710,7 +2126,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
             .expect("the source failed");
         operator
             .start_with(
-                source_id.to_owned(),
+                original_id.to_owned(),
                 StartOptions {
                     workflow_id: Some(operator_id),
                     ..StartOptions::default()
@@ -1986,6 +2402,427 @@ async fn a_workflow_cannot_delete_an_ancestors_tree() {
     dbos.shutdown().await;
 }
 
+/// **A workflow can't cancel or resume itself, and is told so before anything runs.** Both
+/// would clear its own owner token, so its next write would be refused and it would wait for an
+/// outcome nobody computes. Refused, the workflow can catch the error and go on, and finishes.
+#[tokio::test]
+async fn a_workflow_cannot_cancel_or_resume_itself() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("self-cancel-app", &db));
+    let workflow = dbos
+        .register_workflow("self-targeting", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let cancelled = dbos
+                        .cancel(&own_id)
+                        .await
+                        .expect_err("the workflow cancelled itself")
+                        .to_string();
+                    let resumed = dbos
+                        .resume::<(), Error>(&own_id)
+                        .await
+                        .expect_err("the workflow resumed itself")
+                        .to_string();
+                    Ok::<_, Error>((cancelled, resumed))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "targets-itself";
+    let (cancelled, resumed) = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    assert!(cancelled.contains("cannot cancel itself"), "{cancelled}");
+    assert!(resumed.contains("cannot resume itself"), "{resumed}");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
+/// **Nor from inside one of its steps**, where the call records nothing of its own: the step's
+/// record would be refused, and a resume would have every new execution run the step again and
+/// resume itself again, forever.
+#[tokio::test]
+async fn a_step_cannot_cancel_or_resume_its_own_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("step-self-cancel-app", &db));
+    let workflow = dbos
+        .register_workflow("step-self-targeting", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    dbos::step("kick", || {
+                        let (dbos, own_id) = (dbos.clone(), own_id.clone());
+                        async move {
+                            let cancelled = dbos
+                                .cancel(&own_id)
+                                .await
+                                .expect_err("the step cancelled its workflow")
+                                .to_string();
+                            let resumed = dbos
+                                .resume::<(), Error>(&own_id)
+                                .await
+                                .expect_err("the step resumed its workflow")
+                                .to_string();
+                            Ok::<_, Error>((cancelled, resumed))
+                        }
+                    })
+                    .await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "step-targets-its-workflow";
+    let (cancelled, resumed) = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    assert!(cancelled.contains("cannot cancel itself"), "{cancelled}");
+    assert!(resumed.contains("cannot resume itself"), "{resumed}");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
+/// **Nor cancel an ancestor's tree it is inside**, which reaches it through the cascade rather
+/// than by name.
+#[tokio::test]
+async fn a_workflow_cannot_cancel_an_ancestors_tree() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("ancestor-cancel-app", &db));
+    let child = dbos
+        .register_workflow("cancelling-child", {
+            let dbos = dbos.clone();
+            move |root: String| {
+                let dbos = dbos.clone();
+                async move {
+                    Ok::<_, Error>(
+                        dbos.cancel_all(&[&root], Children::Include)
+                            .await
+                            .expect_err("the child cancelled the tree it was in")
+                            .to_string(),
+                    )
+                }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("cancelled-parent", {
+            move |root: String| {
+                let child = child.clone();
+                async move { child.run(root).await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let root = "the-cancelled-ancestor";
+    let message = tokio::time::timeout(
+        Duration::from_secs(10),
+        parent.run_with(
+            root.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(root),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    assert!(
+        message.contains("cannot cancel the tree of the-cancelled-ancestor"),
+        "{message}"
+    );
+    let row = reader(&db).await.get_workflow(root).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
+/// **A refusal is the call's recorded answer**, so a replay raises it again from the checkpoint
+/// rather than deciding it afresh. A fork from the step after the refused cancel replays it: the
+/// fork is a different workflow, so deciding afresh would let it cancel the original.
+#[tokio::test]
+async fn a_refused_self_cancel_is_recorded_and_replayed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refusal-replay-app", &db));
+    let workflow = dbos
+        .register_workflow("refused-then-on", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let refused = dbos
+                        .cancel(&own_id)
+                        .await
+                        .expect_err("the workflow cancelled itself")
+                        .to_string();
+                    let after = dbos::step("after", || async { Ok::<_, Error>(7u32) }).await?;
+                    Ok::<_, Error>((refused, after))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "refused-and-recorded";
+    let original = workflow
+        .run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    let steps = dbos.list_workflow_steps(id).await.unwrap();
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(
+        steps[0].error.is_some(),
+        "the refusal is recorded: {steps:?}"
+    );
+    assert_eq!(
+        (steps[1].step_id, steps[1].step_name.as_str()),
+        (1, "after")
+    );
+
+    let forked = dbos
+        .fork::<(String, u32), Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(Duration::from_secs(10), forked.result())
+        .await
+        .expect("the fork never finished")
+        .expect("the fork failed");
+    assert_eq!(replayed, original, "the fork replays the recorded refusal");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success, "nothing cancelled it");
+
+    dbos.shutdown().await;
+}
+
+/// **The cascade is refused from further down too**, through a grandparent, from inside a step,
+/// and when the caller is one of several ids named. Each refusal comes before anything moves, so
+/// the other ids named alongside are left as they were: one held `DELAYED`, which a cancel would
+/// move, and one already `CANCELLED`, which a resume would.
+#[tokio::test]
+async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("self-target-cases-app", &db));
+    let bystander = dbos
+        .register_workflow("bystander", |(): ()| async { Ok::<_, Error>(()) })
+        .unwrap();
+    let grandchild = dbos
+        .register_workflow("targeting-grandchild", {
+            let dbos = dbos.clone();
+            move |(own_id, root, held, stopped): (String, String, String, String)| {
+                let dbos = dbos.clone();
+                async move {
+                    let tree = dbos
+                        .cancel_all(&[&root], Children::Include)
+                        .await
+                        .expect_err("the grandchild cancelled its grandparent's tree")
+                        .to_string();
+                    let in_step = dbos::step("kick", || {
+                        let (dbos, root) = (dbos.clone(), root.clone());
+                        async move {
+                            Ok::<_, Error>(
+                                dbos.cancel_all(&[&root], Children::Include)
+                                    .await
+                                    .expect_err("a step cancelled its grandparent's tree")
+                                    .to_string(),
+                            )
+                        }
+                    })
+                    .await?;
+                    let among = dbos
+                        .cancel_all(&[&held, &own_id], Children::Skip)
+                        .await
+                        .expect_err("the grandchild cancelled itself among others")
+                        .to_string();
+                    let resumed = dbos
+                        .resume_all::<(), Error>(&[&stopped, &own_id], ResumeOptions::default())
+                        .await
+                        .expect_err("the grandchild resumed itself among others")
+                        .to_string();
+                    Ok::<_, Error>(vec![tree, in_step, among, resumed])
+                }
+            }
+        })
+        .unwrap();
+    let child = dbos
+        .register_workflow("middle-child", {
+            move |(root, held, stopped): (String, String, String)| {
+                let grandchild = grandchild.clone();
+                async move {
+                    let own = format!("{root}-grandchild");
+                    grandchild
+                        .run_with(
+                            (own.clone(), root, held, stopped),
+                            dbos::RunOptions {
+                                workflow_id: Some(&own),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    let root_workflow = dbos
+        .register_workflow("the-grandparent", {
+            move |(root, held, stopped): (String, String, String)| {
+                let child = child.clone();
+                async move { child.run((root, held, stopped)).await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "held-bystanders",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    // Far enough out that neither is released while the test runs.
+    let (held, stopped) = ("a-held-bystander", "a-stopped-bystander");
+    for id in [held, stopped] {
+        bystander
+            .start_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(id),
+                    queue: Some(Enqueue {
+                        delay: Some(Duration::from_secs(3600)),
+                        ..Enqueue::new("held-bystanders")
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("enqueue failed");
+    }
+    dbos.cancel(stopped).await.expect("cancel failed");
+    let root = "the-grandparent-root";
+    let messages = tokio::time::timeout(
+        Duration::from_secs(10),
+        root_workflow.run_with(
+            (root.to_owned(), held.to_owned(), stopped.to_owned()),
+            dbos::RunOptions {
+                workflow_id: Some(root),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    let tree = format!("cannot cancel the tree of {root}");
+    assert!(messages[0].contains(&tree), "{messages:?}");
+    assert!(messages[1].contains(&tree), "{messages:?}");
+    assert!(messages[2].contains("cannot cancel itself"), "{messages:?}");
+    assert!(messages[3].contains("cannot resume itself"), "{messages:?}");
+    for (id, status) in [
+        (root, WorkflowStatus::Success),
+        (held, WorkflowStatus::Delayed),
+        (stopped, WorkflowStatus::Cancelled),
+    ] {
+        let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+        assert_eq!(row.status, status, "{id} was moved");
+    }
+
+    dbos.shutdown().await;
+}
+
+/// **A client is outside every workflow, even one driven from inside a workflow's code**, so its
+/// cancel of the very workflow running it is not refused: the cancel lands, and the workflow stops
+/// at its next step.
+#[tokio::test]
+async fn a_client_inside_a_workflow_may_cancel_that_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("client-self-cancel-app", &db));
+    let client = Client::connect(ClientConfig {
+        app_name: Some("client-self-cancel-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+    let answer = Arc::new(Mutex::new(None));
+    let workflow = dbos
+        .register_workflow("cancelled-by-its-client", {
+            let answer = Arc::clone(&answer);
+            move |own_id: String| {
+                let (client, answer) = (client.clone(), Arc::clone(&answer));
+                async move {
+                    let cancelled = client.cancel(&own_id).await.map_err(|e| e.to_string());
+                    *answer.lock().unwrap() = Some(cancelled);
+                    dbos::step("after", || async { Ok::<_, Error>(()) }).await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "cancelled-by-its-own-client";
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished");
+    assert_eq!(
+        *answer.lock().unwrap(),
+        Some(Ok(())),
+        "the client's cancel was refused"
+    );
+    assert!(
+        outcome.is_err(),
+        "the cancelled workflow finished: {outcome:?}"
+    );
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Cancelled);
+
+    dbos.shutdown().await;
+}
+
 /// A management call through another instance, from inside a workflow, is refused.
 ///
 /// The third place [`Error::WrongInstance`] is reachable from, and it is here for the reason the
@@ -2028,12 +2865,11 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
                 async move {
                     let handle = other
                         .fork_with::<u32, EngineOnly>(
-                            &id,
-                            0,
-                            ForkOptions {
+                            Fork {
                                 forked_id: Some("refused-fork"),
-                                ..ForkOptions::default()
+                                ..Fork::new(&id, 0)
                             },
+                            ForkOptions::default(),
                         )
                         .await?;
                     Ok::<String, Error>(handle.workflow_id().to_owned())
@@ -2349,10 +3185,11 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
 /// **A management call refused by its own arguments moves no step counter.**
 ///
 /// The launch check comes first, then the call's own argument check, and only then the step id —
-/// so `fork_all` refusing a chosen id, and `fork` refusing a negative step, leave the step after
-/// them on the slot it would have had. The instance-level refusals are
-/// covered by `management_through_another_instance_from_inside_a_workflow_is_refused`; these are
-/// the ones the method itself raises.
+/// so `fork_all` refusing a negative step, a duplicated or empty forked id, a zero or oversized
+/// timeout or an invalid replacement map, and `fork` refusing a negative step, leave the step after
+/// them on the slot it would have had. The instance-level refusals are covered by
+/// `management_through_another_instance_from_inside_a_workflow_is_refused`; these are the ones the
+/// method itself raises.
 #[tokio::test]
 async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
     let db = test_database().await;
@@ -2366,27 +3203,76 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
             move |id: String| {
                 let dbos = dbos.clone();
                 async move {
-                    // One id cannot name many forks.
+                    // There is no step below zero to fork from, in a batch or alone.
                     let refused = dbos
                         .fork_all::<u32, EngineOnly>(
-                            &[&id],
-                            0,
-                            ForkOptions {
-                                forked_id: Some("chosen"),
-                                ..ForkOptions::default()
-                            },
+                            &[Fork::new(&id, 0), Fork::new(&id, -1)],
+                            ForkOptions::default(),
                         )
                         .await;
                     assert!(
                         matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
-                        "a chosen id should be refused in bulk"
+                        "a negative step should be refused in bulk"
                     );
 
-                    // And there is no step below zero to fork from.
+                    // Nor two forks under one id, nor a fork under an empty one.
+                    let twice = Fork {
+                        forked_id: Some("chosen-twice"),
+                        ..Fork::new(&id, 0)
+                    };
+                    let empty = Fork {
+                        forked_id: Some(""),
+                        ..Fork::new(&id, 0)
+                    };
+                    for forks in [[twice, twice], [Fork::new(&id, 0), empty]] {
+                        let refused = dbos
+                            .fork_all::<u32, EngineOnly>(&forks, ForkOptions::default())
+                            .await;
+                        assert!(
+                            matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
+                            "{forks:?} should be refused in bulk"
+                        );
+                    }
+
+                    // Nor options the system database would refuse: a zero timeout, one too
+                    // large to store, and a replacement map with an empty replacement.
+                    let empty_replacement = [("some-child", "")];
+                    for options in [
+                        ForkOptions {
+                            timeout: Some(Duration::ZERO),
+                            ..ForkOptions::default()
+                        },
+                        ForkOptions {
+                            timeout: Some(Duration::MAX),
+                            ..ForkOptions::default()
+                        },
+                        ForkOptions {
+                            replacement_children: &empty_replacement,
+                            ..ForkOptions::default()
+                        },
+                    ] {
+                        let refused = dbos
+                            .fork_all::<u32, EngineOnly>(&[Fork::new(&id, 0)], options)
+                            .await;
+                        assert!(
+                            matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
+                            "{options:?} should be refused"
+                        );
+                    }
+
                     let refused = dbos.fork::<u32, EngineOnly>(&id, -1).await;
                     assert!(
                         matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
                         "a negative step should be refused"
+                    );
+
+                    // Nor an instant past the largest the row can hold to release at.
+                    let refused = dbos
+                        .set_workflow_delay(&id, dbos::WorkflowDelay::For(Duration::MAX))
+                        .await;
+                    assert!(
+                        matches!(refused, Err(Error::InvalidArgument { .. })),
+                        "a delay that cannot be stored should be refused"
                     );
 
                     dbos::step("after", || async { Ok(()) }).await?;

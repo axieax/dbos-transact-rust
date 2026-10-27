@@ -554,3 +554,183 @@ async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
     second.shutdown().await;
     first.shutdown().await;
 }
+
+/// **A workflow whose result its encoding refuses is finished, not abandoned**, so a relaunch has
+/// nothing of it to recover: the row is ERROR, and the body, which ran to its end once, does not
+/// run again.
+///
+/// A second workflow is abandoned at the shutdown for the relaunch to recover, so the test knows
+/// the relaunch's recovery has run before it looks.
+#[tokio::test]
+async fn a_workflow_whose_result_cannot_be_encoded_is_not_recovered() {
+    let runs = Arc::new(AtomicU32::new(0));
+    let witness_runs = Arc::new(AtomicU32::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-app", &db));
+    let unencodable = dbos
+        .register_workflow("tuple_keys", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                // `serde_json` has no spelling for a non-string map key.
+                async {
+                    Ok::<_, dbos::Error>(
+                        [((1u8, 2u8), 3u8)]
+                            .into_iter()
+                            .collect::<std::collections::BTreeMap<_, _>>(),
+                    )
+                }
+            }
+        })
+        .unwrap();
+    // Blocks on its first run, so the shutdown abandons it; returns on its recovery.
+    let witness = dbos
+        .register_workflow("witness", {
+            let (runs, entered) = (Arc::clone(&witness_runs), Arc::clone(&entered));
+            move |()| {
+                let first = runs.fetch_add(1, Ordering::SeqCst) == 0;
+                let entered = Arc::clone(&entered);
+                async move {
+                    if first {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok::<_, dbos::Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = unencodable.start(()).await.expect("start failed");
+    let workflow_id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Serialization { what, .. } if what == "result"),
+        "{error:?}"
+    );
+
+    let abandoned = witness.start(()).await.expect("start failed");
+    let witness_id = abandoned.workflow_id().to_owned();
+    tokio::time::timeout(DEADLINE, entered.notified())
+        .await
+        .expect("the witness never started");
+    dbos.shutdown().await;
+
+    let reader = reader(&db).await;
+    let row = reader
+        .get_workflow(&workflow_id)
+        .await
+        .expect("read failed")
+        .expect("the row exists");
+    assert_eq!(row.status, WorkflowStatus::Error, "finished, not abandoned");
+    let attempts = row.recovery_attempts;
+
+    dbos.launch().await.expect("relaunch failed");
+    await_status(&reader, &witness_id, WorkflowStatus::Success).await;
+
+    let row = reader
+        .get_workflow(&workflow_id)
+        .await
+        .expect("read failed")
+        .expect("the row exists");
+    assert_eq!(row.status, WorkflowStatus::Error);
+    assert_eq!(
+        row.recovery_attempts, attempts,
+        "the relaunch never claimed it"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+
+    dbos.shutdown().await;
+}
+
+/// **A step whose result its encoding refuses is not run again by recovery.** The refusal is the
+/// step's recorded error, so a workflow that handles it and carries on, and is then abandoned and
+/// recovered, replays the step from its row rather than repeating its side effects.
+#[tokio::test]
+async fn a_step_whose_result_cannot_be_encoded_is_not_run_again_on_recovery() {
+    let runs = Arc::new(AtomicU32::new(0));
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-step-app", &db));
+    let handles_it = {
+        let runs = Arc::clone(&runs);
+        let (reached, release) = (Arc::clone(&reached_gate), Arc::clone(&release_gate));
+        dbos.register_workflow("handles_it", move |()| {
+            let runs = Arc::clone(&runs);
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                let refused = dbos::step("tuple_keys", || {
+                    let runs = Arc::clone(&runs);
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        // `serde_json` has no spelling for a non-string map key.
+                        Ok::<_, dbos::Error>(
+                            [((1u8, 2u8), 3u8)]
+                                .into_iter()
+                                .collect::<std::collections::BTreeMap<_, _>>(),
+                        )
+                    }
+                })
+                .await;
+                // Handled: the workflow carries on to its gate whatever the step said.
+                let handled = match refused {
+                    Err(Error::Serialization { what, .. }) => what.into_owned(),
+                    other => format!("not refused: {other:?}"),
+                };
+                reached.notify_one();
+                release.notified().await;
+                Ok::<_, dbos::Error>(handled)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    // Run to the gate, then abandon: shutdown aborts the task and the row stays PENDING.
+    let running = tokio::spawn(async move { handles_it.run(()).await });
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the workflow never reached its gate");
+    dbos.shutdown().await;
+    let err = running.await.expect("the task panicked").unwrap_err();
+    assert!(matches!(err, Error::Interrupted { .. }), "{err}");
+
+    let reader = reader(&db).await;
+    let rows = reader
+        .list_workflows(&Default::default(), None)
+        .await
+        .expect("read failed");
+    let [row] = &rows[..] else {
+        panic!("expected exactly one workflow, got {}", rows.len())
+    };
+    assert_eq!(row.status, WorkflowStatus::Pending, "abandoned, not failed");
+    let workflow_id = row.workflow_id.clone();
+    let steps = reader
+        .list_workflow_steps(&workflow_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let [step] = &steps[..] else {
+        panic!("expected exactly one step, got {}", steps.len())
+    };
+    assert_eq!(step.step_id, 0, "the refused step is checkpointed");
+
+    dbos.launch().await.expect("relaunch failed");
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the recovered workflow never reached its gate again");
+    release_gate.notify_one();
+
+    let row = await_status(&reader, &workflow_id, WorkflowStatus::Success).await;
+    assert_eq!(row.output.as_deref(), Some("\"step result\""));
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+
+    dbos.shutdown().await;
+}

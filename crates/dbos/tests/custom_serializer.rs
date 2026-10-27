@@ -11,7 +11,7 @@ use serde_json::json;
 use dbos::{
     Client, ClientConfig, Config, CustomSerializer, DBOS, EngineOnly, Error, Payload, PayloadSlot,
     QueueConflict, QueueOptions, ReadStreamOptions, ScheduleSpec, ScheduledWorkflowInput,
-    SerializationFormat, Serializer, SetEventOptions, WorkflowKey, WorkflowOptions,
+    SerializationFormat, Serializer, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -783,5 +783,276 @@ async fn a_schedules_context_survives_a_format_that_is_not_human_readable() {
         .expect("the run finishes")
         .unwrap();
     assert_eq!(ran, address);
+    dbos.shutdown().await;
+}
+
+/// The one value [`Picky`] will not write.
+const FORBIDDEN: &str = "forbidden";
+
+/// [`Backwards`], except that it refuses the string [`FORBIDDEN`]: a serializer that fails on one
+/// value and writes every other, errors included.
+#[derive(Debug)]
+struct Picky;
+
+impl CustomSerializer for Picky {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(&value)?;
+        if json == serde_json::to_string(FORBIDDEN)? {
+            return Err(format!("{FORBIDDEN} is not to be written").into());
+        }
+        Ok(json.chars().rev().collect())
+    }
+
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Backwards.deserialize(text, into)
+    }
+}
+
+/// **A result the custom serializer refuses is the workflow's error**, written by that serializer:
+/// the row ends ERROR, and the caller and a replay of the same id read back the refusal without the
+/// body running again.
+#[tokio::test]
+async fn a_result_the_custom_serializer_refuses_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("custom-refuses", &db, Serializer::custom(Picky)));
+    let runs = Arc::new(AtomicU32::new(0));
+    let forbidden = dbos
+        .register_workflow("forbidden", {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, Error>(FORBIDDEN.to_owned()) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "result" && message == "forbidden is not to be written"
+        )
+    };
+
+    let handle = forbidden.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+
+    let (status, tag) = row(
+        &db,
+        r#"SELECT status, serialization FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+        &id,
+    )
+    .await;
+    assert_eq!(status.as_deref(), Some("ERROR"));
+    assert_eq!(tag.as_deref(), Some(NAME));
+
+    let replayed = forbidden
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
+}
+
+/// **A step result the custom serializer refuses is the step's error**, written by that serializer
+/// under the step's id; a fork past the step reads the refusal back without entering its body.
+#[tokio::test]
+async fn a_step_result_the_custom_serializer_refuses_is_recorded_as_the_steps_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config(
+        "custom-refuses-step",
+        &db,
+        Serializer::custom(Picky),
+    ));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("handles_it", {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let refused = dbos::step("forbidden", || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Error>(FORBIDDEN.to_owned())
+                        }
+                    })
+                    .await;
+                    match refused {
+                        Err(Error::Serialization { what, message, .. }) => {
+                            Ok::<_, Error>((what.into_owned(), message))
+                        }
+                        other => Err(Error::Config(format!("not refused: {other:?}"))),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let first = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    assert_eq!(
+        first,
+        (
+            "step result".to_owned(),
+            "forbidden is not to be written".to_owned()
+        )
+    );
+
+    let (error, tag) = row(
+        &db,
+        r#"SELECT error, serialization FROM "dbos"."operation_outputs"
+           WHERE workflow_uuid = $1 AND function_id = 0"#,
+        &id,
+    )
+    .await;
+    assert!(
+        error.is_some(),
+        "the refusal is recorded as the step's error"
+    );
+    assert_eq!(tag.as_deref(), Some(NAME));
+
+    let forked = dbos
+        .fork::<(String, String), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, first, "the replay took a different branch");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+    dbos.shutdown().await;
+}
+
+/// [`Backwards`], except that it refuses every JSON object, which every error is natively — the
+/// error itself and the stand-in offered for it alike — while a workflow's `()` input and its
+/// tuple result still write.
+#[derive(Debug)]
+struct NoErrors;
+
+impl CustomSerializer for NoErrors {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(&value)?;
+        if json.starts_with('{') {
+            return Err("no objects".into());
+        }
+        Ok(json.chars().rev().collect())
+    }
+
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Backwards.deserialize(text, into)
+    }
+}
+
+/// **A step error the custom serializer refuses, stand-in and all, records a fixed marker**, so
+/// the step's position still ends without anything of the error stored unencoded. The body is
+/// handed what a replay reads back from the marker — an error that does not decode — on its first
+/// run too, and a fork past the step takes the same branch without entering its body.
+#[tokio::test]
+async fn a_step_error_the_custom_serializer_refuses_records_a_fixed_marker() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config(
+        "custom-refuses-errors",
+        &db,
+        Serializer::custom(NoErrors),
+    ));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("handles_it", {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let refused = dbos::step("declined", || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Err::<(), _>(Error::Application(CardDeclined { attempts: 3 }))
+                        }
+                    })
+                    .await;
+                    match refused {
+                        Err(Error::Deserialization { what, .. }) => {
+                            Ok::<_, Error>(("Deserialization".to_owned(), what.into_owned()))
+                        }
+                        other => Err(Error::Config(format!("not the marker: {other:?}"))),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let first = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    assert_eq!(first, ("Deserialization".to_owned(), "error".to_owned()));
+
+    let (error, tag) = row(
+        &db,
+        r#"SELECT error, serialization FROM "dbos"."operation_outputs"
+           WHERE workflow_uuid = $1 AND function_id = 0"#,
+        &id,
+    )
+    .await;
+    // Fixed text: nothing of the error reaches the column.
+    assert_eq!(
+        error.as_deref(),
+        Some("the error could not be encoded by its serializer")
+    );
+    assert_eq!(tag.as_deref(), Some(NAME));
+
+    let forked = dbos
+        .fork::<(String, String), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, first, "the replay took a different branch");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
     dbos.shutdown().await;
 }

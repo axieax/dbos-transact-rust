@@ -18,7 +18,7 @@
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
 //! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
-use crate::serialization::{PayloadEncoding, decode_error};
+use crate::serialization::{PayloadEncoding, decode_error, encode_error};
 use std::borrow::Cow;
 
 /// The error type of a workflow or step with no failure of its own.
@@ -220,6 +220,12 @@ pub enum Error<E = EngineOnly> {
     },
 
     /// A value could not be encoded for the database.
+    ///
+    /// A workflow's own `result` or `error` that cannot be encoded is that workflow's outcome: it
+    /// is recorded as the workflow's error, and its handle's `result()` and every replay return
+    /// it, rather than the body running again. A step's own `step result` or `step error` that
+    /// cannot be encoded is likewise recorded as that step's error, so a replay returns it rather
+    /// than running the step again.
     #[error("could not serialize the workflow {what}: {message}")]
     Serialization {
         /// Which value: `argument`, `result`, `error`.
@@ -438,6 +444,33 @@ pub enum Error<E = EngineOnly> {
         polled: std::borrow::Cow<'static, str>,
     },
 
+    /// Another durable call of the same workflow took the step position a
+    /// [`patch`](crate::patch()) or [`deprecate_patch`](crate::deprecate_patch()) was built at.
+    ///
+    /// Either call fixes its position where it is built, as every durable call does, but takes it
+    /// only once it has read the workflow's history there, when awaited. A call built in between —
+    /// written after the patch and awaited before it, or built in another branch of the same body,
+    /// one arm of a `tokio::join!` — took the position first. Refused rather than recorded
+    /// elsewhere: await a patch where it is written, from sequential workflow code, before any
+    /// branches start or after they finish.
+    ///
+    /// **A mistake in the code, and recorded like one.** It is the workflow's outcome, as
+    /// [`StepBuiltElsewhere`](Self::StepBuiltElsewhere) is. A call built between a patch and its
+    /// await is refused on every execution, and so is a branch whose call is built before the
+    /// patch is first awaited.
+    #[error(
+        "patch {patch} in workflow {workflow_id} lost step {step_id} to a call built before it \
+         was awaited: await a patch where it is written, from sequential workflow code"
+    )]
+    PatchNondeterminism {
+        /// The workflow that was patching.
+        workflow_id: String,
+        /// The patch's name, as the code gave it.
+        patch: String,
+        /// The position the patch looked at, which another call took.
+        step_id: i32,
+    },
+
     /// A step attempt ran past its timeout and was stopped.
     ///
     /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
@@ -518,6 +551,12 @@ impl<E> From<E> for Error<E> {
     }
 }
 
+/// A system-database refusal's field and detail as one phrase, for a message that names the call
+/// separately: "`delay` must be a positive, non-zero duration".
+pub(crate) fn refusal_detail(field: &str, detail: &str) -> String {
+    format!("`{field}` {detail}")
+}
+
 impl<E> Error<E> {
     /// A system-database failure, in the engine's terms.
     ///
@@ -533,6 +572,36 @@ impl<E> Error<E> {
             }
             other => Error::SystemDatabase(other),
         }
+    }
+
+    /// A system-database refusal of one of a call's arguments, as the surface reports it.
+    ///
+    /// `refuse` builds the error from [`InvalidInput`](crate::sysdb::Error::InvalidInput)'s field
+    /// and detail, which lets each surface name the field the way its own API spells it. Any other
+    /// error is not a refusal and goes through [`from_sysdb`](Self::from_sysdb) unchanged, so a
+    /// backend or connection failure keeps its [`SystemDatabase`](Self::SystemDatabase) variant.
+    ///
+    /// For a surface that refuses an argument by asking the system database's own check rather
+    /// than restating it: the two then cannot disagree about what is storable, and the system
+    /// database still refuses the same value for callers that reach it directly.
+    pub(crate) fn from_refusal(
+        error: crate::sysdb::Error,
+        refuse: impl FnOnce(&str, String) -> Self,
+    ) -> Self {
+        match error {
+            crate::sysdb::Error::InvalidInput { field, detail } => refuse(&field, detail),
+            other => Self::from_sysdb(other),
+        }
+    }
+
+    /// [`from_refusal`](Self::from_refusal) as an [`InvalidArgument`](Self::InvalidArgument) to
+    /// `operation`, its detail phrased by [`refusal_detail`]: "`duration` must fit in milliseconds
+    /// as a 64-bit integer".
+    pub(crate) fn refused_argument(operation: &'static str, error: crate::sysdb::Error) -> Self {
+        Self::from_refusal(error, |field, detail| Error::InvalidArgument {
+            operation: operation.into(),
+            detail: refusal_detail(field, &detail),
+        })
     }
 
     /// A value that could not be encoded for its column; `what` names it, as `"argument"` or
@@ -648,6 +717,15 @@ impl<E> Error<E> {
                 built,
                 polled,
             },
+            Error::PatchNondeterminism {
+                workflow_id,
+                patch,
+                step_id,
+            } => Error::PatchNondeterminism {
+                workflow_id,
+                patch,
+                step_id,
+            },
             Error::MaxStepRetriesExceeded {
                 step,
                 attempts,
@@ -753,7 +831,12 @@ pub(crate) enum Failure {
     Control(Error<EngineOnly>),
 }
 
-/// A workflow's error as its row holds it, with the encoding that says how to read it.
+/// What a row records as a workflow's or a step's error when its custom serializer refuses even the
+/// stand-in [`EncodedError::refused`] offers: fixed text, so nothing of the error itself is stored
+/// unencoded.
+const UNENCODABLE_ERROR: &str = "the error could not be encoded by its serializer";
+
+/// A workflow's or a step's error as its row holds it, with the encoding that says how to read it.
 ///
 /// **The encoding travels with the bytes** because the encodings write an error differently — the
 /// whole [`Error`] natively or in a custom serializer, a `{name, message, code, data}` envelope
@@ -767,6 +850,59 @@ pub(crate) struct EncodedError {
 }
 
 impl EncodedError {
+    /// `error` as its workflow's row records it, in `encoding`.
+    ///
+    /// **Total**, because the row has to end. A failure that is not recorded leaves the row
+    /// `PENDING`, and recovery would run the whole body again, side effects and all, only to fail
+    /// to encode the same error the same way. An error the encoding refuses is recorded as
+    /// [`refused`](Self::refused) describes.
+    pub(crate) fn of<E: DurableError>(error: &Error<E>, encoding: PayloadEncoding) -> Self {
+        match encode_error::<E, EngineOnly>(error, &encoding) {
+            Ok(encoded) => Self { encoded, encoding },
+            Err(refused) => Self::refused(error, refused, encoding, "error"),
+        }
+    }
+
+    /// `error`, which `encoding` has refused with `refused`, as its row records it instead.
+    ///
+    /// Recorded as [`Error::Serialization`] of `what` — `error` for a workflow's, `step error` for
+    /// a step's — with what the serializer said and what the error displayed as its message. That
+    /// one is strings alone, which the built-in encodings always write. For a custom serializer
+    /// that refuses it too, the column holds [`UNENCODABLE_ERROR`], a fixed marker, which a reader
+    /// reports as an error that does not decode. **Never the error's own details**: a custom
+    /// serializer may exist to keep them out of the database, an encrypting one for instance, and
+    /// text the caller chose could also hold a byte the column cannot store. The details go to the
+    /// log instead.
+    pub(crate) fn refused<E: DurableError>(
+        error: &Error<E>,
+        refused: Error<EngineOnly>,
+        encoding: PayloadEncoding,
+        what: &'static str,
+    ) -> Self {
+        let said = match refused {
+            Error::Serialization { message, .. } => message,
+            other => other.to_string(),
+        };
+        let stand_in = Error::<E>::Serialization {
+            what: what.into(),
+            message: format!("{said}; the error was: {error}"),
+            source: None,
+        };
+        tracing::warn!(
+            what,
+            error = %stand_in,
+            "an error could not be encoded; its message is recorded instead"
+        );
+        let encoded = encode_error::<E, EngineOnly>(&stand_in, &encoding).unwrap_or_else(|_| {
+            tracing::warn!(
+                what,
+                "the serializer refused the stand-in too; a fixed marker is recorded"
+            );
+            UNENCODABLE_ERROR.to_owned()
+        });
+        Self { encoded, encoding }
+    }
+
     /// The error this records, in the caller's error type.
     ///
     /// An error that does not decode — a native one some other build wrote in a shape this one
@@ -864,7 +1000,7 @@ mod tests {
             crate::sysdb::Error::WorkflowCancelled {
                 workflow_id: "wf-1".to_owned(),
             },
-            crate::sysdb::Error::StepAlreadyRecorded {
+            crate::sysdb::Error::StepNondeterminism {
                 workflow_id: "wf-1".to_owned(),
                 step_id: 0,
             },
@@ -874,5 +1010,112 @@ mod tests {
             let error: Error = Error::SystemDatabase(signal);
             assert!(error.control().is_some(), "{error} is a signal");
         }
+    }
+
+    /// An application error that cannot be written as JSON: `serde_json` has no spelling for a
+    /// non-string map key.
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    #[error("no keys fit")]
+    struct BadKeys {
+        by_pair: std::collections::HashMap<(u8, u8), u8>,
+    }
+
+    fn bad_keys() -> Error<BadKeys> {
+        BadKeys {
+            by_pair: [((1, 2), 3)].into_iter().collect(),
+        }
+        .into()
+    }
+
+    /// An error its encoding refuses is still recorded, in that encoding, as the refusal: what the
+    /// serializer said and what the error displayed, rather than nothing at all.
+    #[test]
+    fn an_error_its_encoding_refuses_is_recorded_as_the_refusal() {
+        for encoding in [PayloadEncoding::Native, PayloadEncoding::Portable] {
+            let recorded = EncodedError::of(&bad_keys(), encoding.clone());
+            assert_eq!(recorded.encoding, encoding);
+            let read = recorded.decode::<BadKeys>("wf-1");
+            let Error::Serialization { what, message, .. } = &read else {
+                panic!("{} read back as {read:?}", encoding.name())
+            };
+            assert_eq!(what, "error", "{}", encoding.name());
+            assert!(
+                message.contains("key must be a string") && message.ends_with("no keys fit"),
+                "{}: {message}",
+                encoding.name()
+            );
+        }
+    }
+
+    /// A step's refused error is recorded the same way, as a refusal of the step's error, and a
+    /// [`Error::MaxStepRetriesExceeded`] holding refused attempts is refused as a whole.
+    #[test]
+    fn a_steps_refused_error_is_recorded_as_a_refusal_of_the_step_error() {
+        let retried: Error<BadKeys> = Error::MaxStepRetriesExceeded {
+            step: "charge".to_owned(),
+            attempts: 2,
+            errors: vec![bad_keys(), bad_keys()],
+        };
+        for error in [bad_keys(), retried] {
+            for encoding in [PayloadEncoding::Native, PayloadEncoding::Portable] {
+                let refused = encode_error::<BadKeys, EngineOnly>(&error, &encoding)
+                    .expect_err("the encoding refuses a non-string key");
+                let recorded =
+                    EncodedError::refused(&error, refused, encoding.clone(), "step error");
+                let read = recorded.decode::<BadKeys>("wf-1");
+                let Error::Serialization { what, message, .. } = &read else {
+                    panic!("{} read back as {read:?}", encoding.name())
+                };
+                assert_eq!(what, "step error", "{}", encoding.name());
+                assert!(
+                    message.contains("key must be a string")
+                        && message.ends_with(&error.to_string()),
+                    "{}: {message}",
+                    encoding.name()
+                );
+            }
+        }
+    }
+
+    /// A custom serializer that refuses even the stand-in leaves a fixed marker, so the row still
+    /// ends without anything of the error stored unencoded.
+    #[test]
+    fn a_serializer_that_refuses_everything_records_a_fixed_marker() {
+        use crate::serialization::{CustomSerializer, Payload, PayloadSlot, Serializer};
+
+        #[derive(Debug)]
+        struct Refuses;
+
+        impl CustomSerializer for Refuses {
+            fn name(&self) -> &str {
+                "refuses"
+            }
+
+            fn serialize(
+                &self,
+                _: Payload<'_>,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                Err("nothing goes".into())
+            }
+
+            fn deserialize(
+                &self,
+                _: &str,
+                _: PayloadSlot<'_>,
+            ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err("nothing comes back".into())
+            }
+        }
+
+        let error: Error<CardDeclined> = CardDeclined { attempts: 3 }.into();
+        let recorded = EncodedError::of(&error, Serializer::custom(Refuses).encoding());
+        // Nothing of the error reaches the column: the serializer may be there to keep it out.
+        assert_eq!(recorded.encoded, UNENCODABLE_ERROR);
+        // Text the serializer cannot decode back, which a reader reports as that.
+        let read = recorded.decode::<CardDeclined>("wf-1");
+        assert!(
+            matches!(&read, Error::Deserialization { what, .. } if what == "error"),
+            "{read:?}"
+        );
     }
 }

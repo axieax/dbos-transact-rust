@@ -10,6 +10,46 @@
 //! Under construction. The system database layer, the lifecycle, registration, workflows,
 //! steps, events, messaging, recovery, queues, schedules and the client are here.
 //!
+//! # Changing a workflow's code
+//!
+//! A recovered workflow replays the step history it recorded, position by position, so code that
+//! moves, adds or removes steps can no longer replay executions the old code started.
+//! [`patch`](crate::patch()) is the way to make such a change while those executions are in
+//! flight: new executions take the new path and record that they did, and old ones take the old
+//! path. Once no old execution can run again, [`deprecate_patch`](crate::deprecate_patch())
+//! replaces it and the old code goes:
+//!
+//! ```no_run
+//! # async fn step_one() -> dbos::Result<u32> { Ok(1) }
+//! # async fn step_three() -> dbos::Result<u32> { Ok(3) }
+//! # async fn step_two() -> dbos::Result<u32> { Ok(2) }
+//! // Deployed first.
+//! async fn v1(_: ()) -> dbos::Result<u32> {
+//!     Ok(step_one().await? + step_two().await?)
+//! }
+//!
+//! // Deployed while runs of `v1` may still be recovered: they take the old path.
+//! async fn v2(_: ()) -> dbos::Result<u32> {
+//!     let first = if dbos::patch("use-step-three").await? {
+//!         step_three().await?
+//!     } else {
+//!         step_one().await?
+//!     };
+//!     Ok(first + step_two().await?)
+//! }
+//!
+//! // Deployed once no run of `v1` can run again.
+//! async fn v3(_: ()) -> dbos::Result<u32> {
+//!     dbos::deprecate_patch("use-step-three").await?;
+//!     Ok(step_three().await? + step_two().await?)
+//! }
+//! ```
+//!
+//! Old and new code share executions only if they run under one application version, so the
+//! deployments that patch keep [`Config::app_version`] the same. The other way to change a
+//! workflow's code is a new version per deployment, with the old version's executors kept running
+//! until its executions finish; that needs no patch. See [`patch`](crate::patch()#application-version).
+//!
 //! # Cargo features
 //!
 //! - `engine` *(default)* — the durable execution engine: registry, contexts, workflows,
@@ -56,6 +96,8 @@ mod management;
 #[cfg(feature = "engine")]
 mod message;
 #[cfg(feature = "engine")]
+mod patch;
+#[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
@@ -75,6 +117,8 @@ mod sleep;
 mod step;
 #[cfg(feature = "engine")]
 mod stream;
+#[cfg(feature = "engine")]
+mod timeout_sweep;
 #[cfg(feature = "engine")]
 mod wait;
 #[cfg(feature = "engine")]
@@ -103,12 +147,14 @@ pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, E
 pub use instance::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use management::{
-    Children, ForkOptions, ListWorkflowStepsOptions, ResumeOptions, RewindOptions,
+    Children, Fork, ForkOptions, ListWorkflowStepsOptions, ResumeOptions, RewindOptions,
 };
 #[cfg(feature = "engine")]
 pub use message::{
-    Forks, Message, SendBulkOptions, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
+    Forks, SendMessage, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
 };
+#[cfg(feature = "engine")]
+pub use patch::{deprecate_patch, patch};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
@@ -130,7 +176,10 @@ pub use stream::{
     write_stream, write_stream_with,
 };
 #[cfg(feature = "engine")]
-pub use sysdb::types::{Change, RateLimit, ScheduleFilter, ScheduleStatus, WorkflowDelay};
+pub use sysdb::types::{
+    Change, IdleTransactionTimeout, PollingConcurrency, RateLimit, ScheduleFilter, ScheduleStatus,
+    WorkflowDelay,
+};
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
 // oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so
 // this makes `tokio-util` a public dependency rather than sparing anyone one — a major bump of it
@@ -291,6 +340,10 @@ pub use workflow::{
 /// The durable race itself is documented on [`select_step!`](crate::select_step); the reasoning
 /// behind what it records is in `select.rs`.
 ///
+/// It also holds `set_workflow_timeout_sweep_interval`, which this crate's tests use to make the
+/// workflow-timeout sweep run more often. It is here for the same reason: `pub` because a test
+/// binary is another crate, and not API.
+///
 /// Gated on `engine` rather than on `macros`, which is what actually reaches it: these are the
 /// only paths into the race's core, and without them an engine-only build has a module of `pub`
 /// items nothing can call.
@@ -300,4 +353,6 @@ pub mod __private {
     pub use crate::select::{
         Branches, Racing, Recording, check_select, control_error, record_select,
     };
+    // Not for a macro: the one knob tests need that applications shouldn't have.
+    pub use crate::timeout_sweep::set_interval as set_workflow_timeout_sweep_interval;
 }

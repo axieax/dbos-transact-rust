@@ -33,8 +33,7 @@ use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    Applications, NewWorkflow, QueueRecord, Submission, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus,
+    AppScope, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
@@ -243,7 +242,7 @@ async fn refresh_queue_set(
     queues: &Queues,
     warned_internal: &mut bool,
 ) -> Vec<String> {
-    let listed = match executor.sysdb().list_queues(&Applications::Unset).await {
+    let listed = match executor.sysdb().list_queues(&AppScope::Unset).await {
         Ok(listed) => listed,
         Err(error) => {
             tracing::warn!(error = %error, "could not list queues; keeping the current set");
@@ -339,9 +338,9 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
         let ceiling = floor.max(MAX_POLLING_INTERVAL);
         interval = interval.clamp(floor, ceiling);
 
-        let backs_off = poll_once(&executor, &queue, &running)
-            .await
-            .is_some_and(Contention::backs_off);
+        let polled = poll_once(&executor, &queue, &running).await;
+        tracing::trace!(claims = polled.claims, "polled the queue");
+        let backs_off = polled.contention.is_some_and(Contention::backs_off);
 
         interval = if backs_off {
             interval.mul_f64(BACKOFF_FACTOR).min(ceiling)
@@ -366,7 +365,23 @@ fn worker_budget(queue: &QueueRecord, running: i64) -> Option<i64> {
         .map(|worker| (i64::from(worker) - running).max(0))
 }
 
-/// One dequeue and the dispatch of whatever it claimed. Reports the contention it met, if any.
+/// What one poll of a queue met.
+#[derive(Debug, Default)]
+struct Polled {
+    /// The contention that ended it, if any.
+    contention: Option<Contention>,
+    /// How many claim transactions it ran — one per partition visited, when it walked them.
+    claims: usize,
+}
+
+impl Polled {
+    fn new(contention: Option<Contention>, claims: usize) -> Self {
+        Self { contention, claims }
+    }
+}
+
+/// One dequeue and the dispatch of whatever it claimed. Reports the contention it met, if any, and
+/// how many claims it took to get there.
 ///
 /// **Three shapes, which is the split TypeScript makes.** An unpartitioned queue is one claim. A
 /// partitioned queue whose only limit is one-at-a-time-per-key is a single batched sweep, which is
@@ -374,18 +389,31 @@ fn worker_budget(queue: &QueueRecord, running: i64) -> Option<i64> {
 /// partitioned queue walks its partitions one at a time, because the limits it carries have to be
 /// counted within each key — and in a shuffled order, so a queue with more partitions than budget
 /// does not starve the ones sorting last.
+///
+/// **The walk is bounded by the queue-wide limits as well as by the worker's own.** Each visit is
+/// a claim transaction, at a stricter isolation whenever the queue carries a shared limit, and with
+/// a queue-wide limit spent every one of them claims nothing, so a queue with tens of thousands of waiting partitions would otherwise pay
+/// that many transactions a poll to learn one fact. The queue's room under its global concurrency
+/// is read once up front: none means no partition is visited at all, and the walk ends as soon as
+/// this poll has claimed it. A claim that reports a queue-wide limit closed — a peer filled it
+/// since, or the rate limit's window is full — ends the walk too, since every other key would
+/// report the same.
 async fn poll_once(
     executor: &Arc<Executor>,
     queue: &QueueRecord,
     running: &Arc<Running>,
-) -> Option<Contention> {
+) -> Polled {
+    // One token per claim: every row a claim takes is owned by it.
+    let owner_xid = || uuid::Uuid::new_v4().to_string();
     if !queue.is_partitioned() {
+        let owner_xid = owner_xid();
         return match executor
             .sysdb()
             .start_queued_workflows(
                 queue,
                 executor.executor_id(),
                 executor.app_version(),
+                &owner_xid,
                 None,
                 running.count(&queue.name),
                 0,
@@ -393,10 +421,18 @@ async fn poll_once(
             .await
         {
             Ok(claimed) => {
-                dispatch_claimed(executor, queue, None, running, claimed).await;
-                None
+                dispatch_claimed(
+                    executor,
+                    queue,
+                    None,
+                    running,
+                    claimed.workflow_ids,
+                    &owner_xid,
+                )
+                .await;
+                Polled::new(None, 1)
             }
-            Err(error) => report_dequeue_error(&error),
+            Err(error) => Polled::new(report_dequeue_error(&error), 1),
         };
     }
 
@@ -405,7 +441,7 @@ async fn poll_once(
     let already_running = running.count(&queue.name);
     let budget = worker_budget(queue, already_running);
     if budget == Some(0) {
-        return None;
+        return Polled::default();
     }
 
     // The batched path, and the only one that does not count: see
@@ -416,12 +452,14 @@ async fn poll_once(
         && queue.rate_limit.is_none()
         && queue.partition_rate_limit.is_none()
     {
+        let owner_xid = owner_xid();
         return match executor
             .sysdb()
             .start_queued_partitioned_workflows(
                 queue,
                 executor.executor_id(),
                 executor.app_version(),
+                &owner_xid,
                 budget,
             )
             .await
@@ -429,29 +467,57 @@ async fn poll_once(
             Ok(claimed) => {
                 // The sweep returns one head per partition and does not say which; each claimed
                 // row carries its own key, so the tally is credited from the rows themselves.
-                dispatch_claimed(executor, queue, None, running, claimed).await;
-                None
+                dispatch_claimed(executor, queue, None, running, claimed, &owner_xid).await;
+                Polled::new(None, 1)
             }
-            Err(error) => report_dequeue_error(&error),
+            Err(error) => Polled::new(report_dequeue_error(&error), 1),
         };
+    }
+
+    // The room left under the queue's global concurrency, across every executor: `None` when it
+    // has none. One count rather than one per partition, and a snapshot rather than a promise —
+    // each claim below counts again in its own transaction, so a peer that spends the room in the
+    // meantime costs this walk a claim, not an overrun.
+    let global_room = match queue.concurrency {
+        None => None,
+        Some(concurrency) => {
+            match executor
+                .sysdb()
+                .count_pending_queue_workflows(&queue.name)
+                .await
+            {
+                Ok(pending) => Some((i64::from(concurrency) - pending).max(0)),
+                Err(error) => return Polled::new(report_dequeue_error(&error), 0),
+            }
+        }
+    };
+    // Not even listed: with the queue full, every partition would claim nothing.
+    if global_room == Some(0) {
+        return Polled::default();
     }
 
     let partitions = match executor.sysdb().get_queue_partitions(&queue.name).await {
         Ok(partitions) => shuffled(partitions),
-        Err(error) => return report_dequeue_error(&error),
+        Err(error) => return Polled::new(report_dequeue_error(&error), 0),
     };
 
     let mut claimed_here = 0i64;
+    let mut claims = 0usize;
     for partition in partitions {
-        if worker_budget(queue, already_running + claimed_here) == Some(0) {
+        if worker_budget(queue, already_running + claimed_here) == Some(0)
+            || global_room.is_some_and(|room| claimed_here >= room)
+        {
             break;
         }
+        claims += 1;
+        let owner_xid = owner_xid();
         let claimed = match executor
             .sysdb()
             .start_queued_workflows(
                 queue,
                 executor.executor_id(),
                 executor.app_version(),
+                &owner_xid,
                 Some(&partition),
                 already_running + claimed_here,
                 running.count_for_partition(&queue.name, &partition),
@@ -476,10 +542,28 @@ async fn poll_once(
                 continue;
             }
         };
-        claimed_here += i64::try_from(claimed.len()).unwrap_or(i64::MAX);
-        dispatch_claimed(executor, queue, Some(&partition), running, claimed).await;
+        claimed_here += i64::try_from(claimed.workflow_ids.len()).unwrap_or(i64::MAX);
+        dispatch_claimed(
+            executor,
+            queue,
+            Some(&partition),
+            running,
+            claimed.workflow_ids,
+            &owner_xid,
+        )
+        .await;
+        if let Some(stop) = claimed.stopped_by
+            && stop.spans_partitions()
+        {
+            tracing::debug!(
+                partition,
+                ?stop,
+                "a queue-wide limit has no room left; ending the partition walk"
+            );
+            break;
+        }
     }
-    None
+    Polled::new(None, claims)
 }
 
 /// Logs a failed dequeue at the level it deserves, and reports the contention it was, if any.
@@ -521,6 +605,7 @@ async fn dispatch_claimed(
     partition: Option<&str>,
     running: &Arc<Running>,
     claimed: Vec<String>,
+    owner_xid: &str,
 ) {
     if claimed.is_empty() {
         return;
@@ -545,12 +630,14 @@ async fn dispatch_claimed(
     {
         Ok(rows) => rows,
         Err(error) => {
-            // The rows stay `PENDING` with this executor's id on them, which is what recovery is
-            // for. Nothing is lost; this tick is.
+            // The rows stay `PENDING` with this executor's id on them, and recovery re-enqueues
+            // them when this executor next launches; until then they count against the queue's
+            // concurrency. Nothing is lost; this tick is, and the rows wait for the restart.
             tracing::warn!(
                 error = %error,
                 claimed = claimed.len(),
-                "could not read the claimed workflows; they stay PENDING for recovery"
+                "could not read the claimed workflows; they stay PENDING until this executor \
+                 restarts"
             );
             return;
         }
@@ -564,6 +651,16 @@ async fn dispatch_claimed(
     }
 
     tracing::debug!(workflows = rows.len(), "dequeued workflows");
+
+    // **A reading of the database's clock, for timing the claimed deadlines.** The claim set each
+    // one on that clock, and a wait for it is measured from a reading of it rather than this
+    // host's wall clock. One per batch, and none for a batch with no deadline in it, which times
+    // nothing. A wait measured from it ends late by the reading's return trip, never early.
+    let clock = if rows.iter().any(|row| row.deadline.is_some()) {
+        timing_clock(executor.sysdb().database_time().await)
+    } else {
+        local_clock()
+    };
 
     // **Dispatched in claim order, not in the order the read came back.** The claim sorts its
     // batch into dequeue order and says so, because that order is what `priority` is for; the
@@ -587,11 +684,12 @@ async fn dispatch_claimed(
         // Claimed before the dispatch, so the next iteration's counts include it even if this one
         // is still starting. `dispatch` drops the slot itself if it does not spawn.
         let slot = running.claim(&queue.name, partition);
-        if let Err(error) = dispatch(executor, row, Submission::Dequeue, Some(slot)).await {
+        if let Err(error) = dispatch(executor, row, owner_xid, clock, Some(slot)).await {
             tracing::warn!(
                 workflow_id,
                 error = %error,
-                "could not start the dequeued workflow; it stays PENDING for recovery"
+                "could not start the dequeued workflow; it stays PENDING until this executor \
+                 restarts"
             );
         }
     }
@@ -600,18 +698,18 @@ async fn dispatch_claimed(
 /// Submits one workflow from the row that describes it, if this executor still can and should.
 ///
 /// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
-/// describes — look the registration up by the row's own name, re-assert the claim, and spawn —
-/// and that is what this does. It takes the row rather than fetching it because the claim already
-/// read every row it took in one round trip, which is the shape Python's
-/// `start_dequeued_workflows` chose and the reason
-/// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
+/// describes — look the registration up by the row's own name, check the row is still `PENDING`,
+/// and spawn — and that is what this does. It takes the row rather than
+/// fetching it because the claim already read every row it took in one round trip, which is the
+/// reason [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns
+/// ids.
 ///
-/// [`Submission::Dequeue`] claims a row another executor may hold and counts against the recovery
-/// budget — that is what [`Submission::claims_ownership`] is — so the cap below is not a
-/// parameter. [`Submission::Fresh`] does not belong here: a first attempt starts from arguments,
-/// not from a row, and has never been through this path.
+/// `owner_xid` is the claim's token. The execution presents it on every write, so if the row is
+/// handed to another execution since the claim (a resume, a recovery), this one's first write is
+/// refused. That is the only check of ownership here: a row claimed again before the read is
+/// `PENDING` and runs, and its first step's body runs before that write is refused.
 ///
-/// **The registry is consulted before the row is claimed, and that is harmless rather than
+/// **The registry is consulted after the row is claimed, and that is harmless rather than
 /// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
 /// stamped `executor_id` before this is reached, so there is nothing for the order to save. What
 /// it does mean is that a row this process cannot run is never parked, however many attempts it
@@ -628,7 +726,8 @@ async fn dispatch_claimed(
 async fn dispatch(
     executor: &Arc<Executor>,
     row: WorkflowRecord,
-    submission: Submission,
+    owner_xid: &str,
+    clock: DatabaseTime,
     slot: Option<Slot>,
 ) -> crate::Result<()> {
     let workflow_id = row.workflow_id;
@@ -644,8 +743,8 @@ async fn dispatch(
         //
         // TODO(dbos-team): UPSTREAM item 24, the cap this skip never reaches. The claim already
         // counted this dispatch — `start_queued_workflows` does `recovery_attempts + 1` — and
-        // `init_workflow` is the only place that reads that count against the cap and parks the
-        // row, so returning here skips it: the row is claimed, counted, skipped, re-enqueued by
+        // the cap below is the only place that reads that count and parks the row, so returning
+        // here skips it: the row is claimed, counted, skipped, re-enqueued by
         // recovery, and claimed again, with nothing ever parking it. All four implementations
         // have the same hole, and for them the order is forced because the budget is read off the
         // registration whose absence is the problem. Here it is `MAX_RECOVERY_ATTEMPTS`, a
@@ -659,75 +758,39 @@ async fn dispatch(
         return Ok(());
     }
 
-    let initialized = match executor
-        .sysdb()
-        .init_workflow(
-            &NewWorkflow {
-                name: Some(&key.name),
-                class_name: key.class_name.as_deref(),
-                config_name: key.config_name.as_deref(),
-                input: row.input.as_deref(),
-                // The row's own, not this executor's default: a submission from a row must not
-                // rewrite how a payload it did not encode is described.
-                serialization: row.serialization.as_deref(),
-                // The queue the row is already on. Omitting it does not mean "leave the queue
-                // alone" — `init_workflow` reads it as `None` and warns that the workflow is
-                // being submitted onto a different queue, which for every dequeued row is both
-                // untrue and unavoidable. Passing the row's own value is what lets that warning
-                // go on meaning a genuine requeue.
-                queue_name: row.queue_name.as_deref(),
-                executor_id: Some(executor.executor_id()),
-                application_name: Some(executor.app_name()),
-                application_version: Some(executor.app_version()),
-                ..NewWorkflow::new(&workflow_id)
-            },
-            Some(MAX_RECOVERY_ATTEMPTS),
-            submission,
-            // A dequeue starts nothing: the row exists and the workflow it belongs to was
-            // recorded against whatever started it, however long ago.
-            None,
-        )
-        .await
-    {
-        Ok(initialized) => initialized,
-        // Parked, not failed to submit: the row is now MAX_RECOVERY_ATTEMPTS_EXCEEDED and no
-        // later launch or dequeue will pick it up, which deserves its own line rather than the
-        // generic one.
-        Err(error @ sysdb::Error::MaxRecoveryAttemptsExceeded { .. }) => {
-            tracing::warn!(workflow_id, error = %error, "the workflow is parked");
+    match admission(row.status, row.recovery_attempts) {
+        Admission::Run => {}
+        Admission::NotPending => {
+            tracing::warn!(
+                workflow_id,
+                status = %row.status,
+                "the dequeued workflow is no longer pending; it is not started"
+            );
             return Ok(());
         }
-        Err(error) => return Err(Error::SystemDatabase(error)),
-    };
-
-    // **Only a `PENDING` row can own its outcome.** A row that moved on since the claim —
-    // cancelled, resumed, or finished by a rival execution — would run for nothing, and a resumed
-    // one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`, so
-    // running it here while the next sweep claims it again is one workflow executing twice.
-    //
-    // The status is `init_workflow`'s own `RETURNING`, and its `ON CONFLICT` never writes the
-    // status column — so this is what the row holds as of a round trip ago, rather than as of the
-    // batch read that preceded every dispatch in this tick. The other four check the batch read's
-    // copy (`_core.py`, `dbos-executor.ts`, `queue.go`, and Java's non-owner rollback), which
-    // narrows the window rather than closing it; this narrows it further.
-    //
-    // `should_execute` cannot stand in for this. It reports whether another owner holds the row
-    // *and this caller is not claiming it* — and a dequeue always claims, so it is `true` here
-    // whatever the row says.
-    if initialized.status != WorkflowStatus::Pending {
-        tracing::warn!(
-            workflow_id,
-            status = %initialized.status,
-            "the dequeued workflow is no longer pending; it is not started"
-        );
-        return Ok(());
+        Admission::Park => {
+            match executor
+                .sysdb()
+                .dead_letter_workflows(&[&workflow_id], row.recovery_attempts)
+                .await
+            {
+                Ok(parked) if !parked.is_empty() => tracing::warn!(
+                    workflow_id,
+                    attempts = row.recovery_attempts,
+                    limit = MAX_RECOVERY_ATTEMPTS,
+                    "the workflow exceeded its recovery attempts and is parked"
+                ),
+                Ok(_) => {}
+                Err(error) => return Err(Error::SystemDatabase(error)),
+            }
+            return Ok(());
+        }
     }
 
     tracing::debug!(
         workflow_id,
         workflow = %key,
-        attempt = initialized.recovery_attempts,
-        submission = ?submission,
+        attempt = row.recovery_attempts,
         "running the workflow"
     );
     // Detached: submitted workflows run concurrently and the caller moves on. The handle is not
@@ -739,10 +802,11 @@ async fn dispatch(
         executor,
         key,
         workflow_id,
+        owner_xid.to_owned(),
         row.input,
         // The row's own tag, which is how its input was written — by this SDK or another.
         row.serialization,
-        initialized.deadline,
+        crate::workflow::Deadline::of(row.deadline, clock),
         slot,
     );
     Ok(())
@@ -808,6 +872,61 @@ pub(crate) fn random_unit() -> f64 {
     f64::from(bits) / f64::from(u32::MAX).next_up()
 }
 
+/// What a dispatch does with a claimed row, decided on the batch read's copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Started.
+    Run,
+    /// Left alone. **Only a `PENDING` row can own its outcome**: a row that moved on since the
+    /// claim (cancelled, resumed, or finished by another execution) would run for nothing, and a
+    /// resumed one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`,
+    /// so running it here while the next sweep claims it again is one workflow executing twice.
+    NotPending,
+    /// Parked, once it has been dispatched more often than allowed. The claim counted this
+    /// attempt; a workflow that keeps being recovered without finishing is crashing its
+    /// executors, and running it again would crash another. The park's guard on the count leaves
+    /// a row alone that a resume reset meanwhile. A row another claim has taken since is parked
+    /// too, and rightly: that claim counted one more attempt, so its own dispatch would park it.
+    Park,
+}
+
+/// The status first, so a row that is no longer `PENDING` is left as it is whatever its count.
+fn admission(status: WorkflowStatus, recovery_attempts: i64) -> Admission {
+    if status != WorkflowStatus::Pending {
+        Admission::NotPending
+    } else if recovery_attempts > MAX_RECOVERY_ATTEMPTS + 1 {
+        Admission::Park
+    } else {
+        Admission::Run
+    }
+}
+
+/// The clock a batch's deadlines are timed from: the database's reading, or, if the read failed
+/// outright, this host's.
+///
+/// The fallback trades accuracy for progress. Skew between the two clocks moves the deadlines of
+/// this one batch, where holding the rows back instead would leave them `PENDING` under a live
+/// executor, counting against the queue's concurrency, until it next launched.
+///
+/// **A lost connection never reaches it.** The read is retried until the database answers, like
+/// every system-database call and like the batch read just before it, so an unreachable database
+/// holds the batch there rather than here. Nothing dispatched sooner would get further: its first
+/// checkpoint would wait on the same database.
+fn timing_clock(reading: Result<DatabaseTime, sysdb::Error>) -> DatabaseTime {
+    reading.unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            "could not read the database's clock; the claimed deadlines are timed from this host's"
+        );
+        local_clock()
+    })
+}
+
+/// A reading of this host's wall clock, in the shape a database reading takes.
+fn local_clock() -> DatabaseTime {
+    DatabaseTime::read(Timestamp::now().as_epoch_ms())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,5 +969,358 @@ mod tests {
             contention(&sysdb::Error::Malformed("bad row".to_owned())),
             None
         );
+    }
+
+    /// **A claimed row that has been claimed again since runs, but records nothing.** It is
+    /// `PENDING` under another claim's token, so its body runs and its outcome write is refused;
+    /// the row stays the owner's, and the owner's run is the one that records the outcome.
+    #[tokio::test]
+    async fn a_row_claimed_again_since_records_nothing() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..crate::Config::new("dispatch-test", db.url())
+        });
+        let runs = Arc::new(AtomicU32::new(0));
+        let dbos_runs = Arc::clone(&runs);
+        dbos.register_workflow("counted", move |()| {
+            let runs = Arc::clone(&dbos_runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>(())
+            }
+        })
+        .unwrap();
+        dbos.launch().await.expect("launch failed");
+        let executor = dbos.executor("test").expect("launched");
+        executor
+            .sysdb()
+            .init_workflow(
+                &crate::sysdb::types::NewWorkflow {
+                    name: Some("counted"),
+                    input: Some("null"),
+                    serialization: Some("rust_serde"),
+                    ..crate::sysdb::types::NewWorkflow::new("wf-reclaimed")
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let row = || async {
+            executor
+                .sysdb()
+                .get_workflow("wf-reclaimed")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let owner = row().await.owner_xid.expect("a started row is owned");
+
+        dispatch(
+            &executor,
+            row().await,
+            "an-earlier-claim",
+            local_clock(),
+            None,
+        )
+        .await
+        .unwrap();
+        let ran = |n: u32| {
+            let runs = Arc::clone(&runs);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while runs.load(Ordering::SeqCst) < n {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "run {n} never started"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        ran(1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let held = row().await;
+        assert_eq!(
+            held.status,
+            WorkflowStatus::Pending,
+            "a stale claim settled it"
+        );
+        assert_eq!(held.owner_xid.as_deref(), Some(owner.as_str()));
+
+        dispatch(&executor, row().await, &owner, local_clock(), None)
+            .await
+            .unwrap();
+        ran(2).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while row().await.status != WorkflowStatus::Success {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the owner's run never recorded its outcome"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        dbos.shutdown().await;
+    }
+
+    /// A launched executor that polls no queue of its own accord, with `queue` registered and one
+    /// workflow waiting on each of `partitions` partitions of it.
+    ///
+    /// `listen_queues` is empty so the only polls of the queue are the test's own, which is what
+    /// lets a test count the claims one poll makes.
+    async fn partitioned_backlog(
+        queue: crate::sysdb::types::NewQueue<'_>,
+        partitions: usize,
+    ) -> (
+        crate::DBOS,
+        Arc<Executor>,
+        dbos_test_support::TestDatabase,
+        QueueRecord,
+    ) {
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            listen_queues: Some(Vec::new()),
+            ..crate::Config::new("walk-test", db.url())
+        });
+        dbos.register_workflow("noop", |()| async { Ok::<_, crate::Error>(()) })
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+        let executor = dbos.executor("test").expect("launched");
+        let sysdb = executor.sysdb();
+        sysdb
+            .upsert_queue(&queue, crate::sysdb::types::OnExistingQueue::Update)
+            .await
+            .unwrap();
+        for n in 0..partitions {
+            let id = format!("wf-waiting-{n}");
+            let partition = format!("p-{n}");
+            sysdb
+                .init_workflow(
+                    &crate::sysdb::types::NewWorkflow {
+                        name: Some("noop"),
+                        input: Some("null"),
+                        serialization: Some("rust_serde"),
+                        queue_name: Some(queue.name),
+                        queue_partition_key: Some(&partition),
+                        application_version: Some(executor.app_version()),
+                        ..crate::sysdb::types::NewWorkflow::new(&id)
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let registered = sysdb.get_queue(queue.name).await.unwrap().unwrap();
+        (dbos, executor, db, registered)
+    }
+
+    /// Puts a workflow on `partition` of `queue` that started moments ago and is still running,
+    /// as a peer's claim would have left it: it holds a slot of the queue's concurrency and rate
+    /// limit, and of the partition's.
+    async fn started_elsewhere(
+        executor: &Executor,
+        db: &dbos_test_support::TestDatabase,
+        queue: &str,
+        partition: &str,
+    ) {
+        executor
+            .sysdb()
+            .init_workflow(
+                &crate::sysdb::types::NewWorkflow {
+                    name: Some("noop"),
+                    input: Some("null"),
+                    serialization: Some("rust_serde"),
+                    application_version: Some(executor.app_version()),
+                    ..crate::sysdb::types::NewWorkflow::new("wf-started-elsewhere")
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_status"
+               SET queue_name = $1, queue_partition_key = $2, rate_limited = TRUE,
+                   started_at_epoch_ms = (EXTRACT(epoch FROM now()) * 1000)::bigint
+               WHERE workflow_uuid = 'wf-started-elsewhere'"#,
+        )
+        .bind(queue)
+        .bind(partition)
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    }
+
+    /// **A partitioned queue whose global concurrency is already spent visits no partition**,
+    /// however many are waiting: the one pending count up front shows there is no room, so the
+    /// poll neither lists the partitions nor pays a claim transaction for each of them.
+    #[tokio::test]
+    async fn a_walk_with_the_queue_wide_concurrency_spent_visits_no_partition() {
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(1),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
+        started_elsewhere(&executor, &db, "walked", "elsewhere").await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(polled.claims, 0, "no partition should have been visited");
+        assert_eq!(polled.contention, None);
+        dbos.shutdown().await;
+    }
+
+    /// **A spent queue-wide rate limit ends the walk on its first claim.** The pending count
+    /// cannot see a rate limit, so one claim is paid to learn it; that claim reports the limit,
+    /// and since it spans every partition the rest are not visited.
+    #[tokio::test]
+    async fn a_walk_with_the_queue_wide_rate_limit_spent_stops_after_one_claim() {
+        let queue = crate::sysdb::types::NewQueue {
+            rate_limit: Some(crate::sysdb::types::RateLimit {
+                limit: 1,
+                period: Duration::from_secs(3600),
+            }),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
+        started_elsewhere(&executor, &db, "walked", "elsewhere").await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 1,
+            "the first claim's stop should end the walk"
+        );
+        assert_eq!(polled.contention, None);
+        dbos.shutdown().await;
+    }
+
+    /// **A partition at its own limit does not end the walk.** Only a limit counted across the
+    /// whole queue says anything about the next key, so a walk that meets a full partition skips
+    /// it and goes on to claim from every other one.
+    #[tokio::test]
+    async fn a_full_partition_does_not_end_the_walk() {
+        // A queue-wide concurrency with room to spare keeps this queue off the batched sweep, so
+        // the poll walks its partitions one claim at a time.
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(100),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 5).await;
+        // Exact only where every claim delivers what it is entitled to. On CockroachDB a claim can
+        // come back short of a row enqueued moments ago, leaving one of the open partitions'
+        // rows waiting through no fault of the walk.
+        if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
+            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            dbos.shutdown().await;
+            return;
+        }
+        // `p-0` is at its one-at-a-time limit; the other four partitions are open.
+        started_elsewhere(&executor, &db, "walked", "p-0").await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 5,
+            "every partition visited, the full one included, wherever the shuffle put it"
+        );
+        assert_eq!(polled.contention, None);
+        let waiting: Vec<String> = sqlx::query_scalar(
+            r#"SELECT workflow_uuid FROM "dbos"."workflow_status"
+               WHERE queue_name = 'walked' AND status = 'ENQUEUED'"#,
+        )
+        .fetch_all(&db.pool().await)
+        .await
+        .unwrap();
+        assert_eq!(
+            waiting,
+            ["wf-waiting-0"],
+            "only the full partition's row should still be waiting"
+        );
+        dbos.shutdown().await;
+    }
+
+    /// **A walk stops once it has claimed the room the queue had**, rather than visiting the
+    /// remaining partitions to be told each time that the queue is now full.
+    #[tokio::test]
+    async fn a_walk_stops_once_the_queue_wide_room_is_claimed() {
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(2),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
+        // Exact only where every claim delivers what it is entitled to. On CockroachDB a claim can
+        // come back short of a row enqueued moments ago, and each short claim costs the walk one
+        // more visit; the walk is still bounded there, just not to this count.
+        if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
+            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            dbos.shutdown().await;
+            return;
+        }
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 2,
+            "one claim per unit of room, and none after it is spent"
+        );
+        assert_eq!(polled.contention, None);
+        // Counted as no longer waiting rather than as pending: the claimed workflows are
+        // dispatched, and may already have finished.
+        let claimed: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "dbos"."workflow_status"
+               WHERE queue_name = 'walked' AND status <> 'ENQUEUED'"#,
+        )
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap();
+        assert_eq!(claimed, 2, "exactly the room the queue had");
+        dbos.shutdown().await;
+    }
+
+    /// A row that moved on since the claim is not started, and is not parked either, however many
+    /// attempts it carries; a `PENDING` one runs up to the limit and is parked past it.
+    #[test]
+    fn a_claimed_row_runs_only_while_pending_and_within_its_attempts() {
+        let limit = MAX_RECOVERY_ATTEMPTS + 1;
+        for status in [
+            WorkflowStatus::Cancelled,
+            WorkflowStatus::Enqueued,
+            WorkflowStatus::Success,
+        ] {
+            assert_eq!(admission(status, 1), Admission::NotPending, "{status}");
+            assert_eq!(
+                admission(status, limit + 1),
+                Admission::NotPending,
+                "{status}"
+            );
+        }
+        assert_eq!(admission(WorkflowStatus::Pending, 1), Admission::Run);
+        assert_eq!(admission(WorkflowStatus::Pending, limit), Admission::Run);
+        assert_eq!(
+            admission(WorkflowStatus::Pending, limit + 1),
+            Admission::Park
+        );
+    }
+
+    /// A failed read of the database's clock times the batch from this host's instead, so its
+    /// deadlines still run out rather than holding the rows back.
+    #[test]
+    fn a_failed_clock_read_times_from_this_host() {
+        let in_a_minute = Timestamp::from_epoch_ms(Timestamp::now().as_epoch_ms() + 60_000);
+        let expires =
+            timing_clock(Err(sysdb::Error::Malformed("no clock".to_owned()))).reaches(in_a_minute);
+        let left = expires.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            (Duration::from_secs(58)..=Duration::from_secs(60)).contains(&left),
+            "{left:?}"
+        );
+
+        let read = DatabaseTime::read(0);
+        assert_eq!(timing_clock(Ok(read)), read, "a reading is used as it is");
     }
 }

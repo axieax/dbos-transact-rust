@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Error, QueueConflict, QueueOptions,
-    StartOptions,
+    StartOptions, StepOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -141,32 +141,38 @@ async fn a_dequeued_row_in_an_unreadable_encoding_is_not_run() {
     dbos.shutdown().await;
 }
 
-/// A start that claims a row it did not create runs the row's input, not the one it was called
-/// with: only the creator writes a row's input, and a recovery of the row would run what it holds.
-/// The same whether the row's tag is the caller's own or absent.
+/// A row another execution created runs the row's input, not the one a later start was called
+/// with: only the creator writes a row's input, and a start that finds the row runs nothing of its
+/// own. The row here is a crash's leftover, so the launch's recovery is what runs it. The same
+/// whether the row's tag is the caller's own or absent.
 #[tokio::test]
 async fn a_start_of_an_existing_row_runs_the_rows_input() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("tag-existing", &db));
+    let config = config("tag-existing", &db);
+    for (id, tag) in [("wf-tagged", Some("rust_serde")), ("wf-untagged", None)] {
+        // Pending under this executor and version, as a run that crashed before its first step.
+        sqlx::query(
+            r#"INSERT INTO "dbos"."workflow_status"
+                 (workflow_uuid, name, status, inputs, created_at, serialization,
+                  executor_id, application_version)
+               VALUES ($1, 'echo', 'PENDING', '"stored"',
+                       (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, $2, 'local', $3)"#,
+        )
+        .bind(id)
+        .bind(tag)
+        .bind(config.app_version.as_deref())
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    }
+
+    let dbos = DBOS::new(config);
     let echo = dbos
         .register_workflow("echo", |text: String| async move { Ok::<_, Error>(text) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    for (id, tag) in [("wf-tagged", Some("rust_serde")), ("wf-untagged", None)] {
-        // Pending and unowned, as a row whose first run never got going: the start claims it.
-        sqlx::query(
-            r#"INSERT INTO "dbos"."workflow_status"
-                 (workflow_uuid, name, status, inputs, created_at, serialization)
-               VALUES ($1, 'echo', 'PENDING', '"stored"',
-                       (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, $2)"#,
-        )
-        .bind(id)
-        .bind(tag)
-        .execute(&db.pool().await)
-        .await
-        .unwrap();
-
+    for id in ["wf-tagged", "wf-untagged"] {
         let handle = echo
             .start_with(
                 "caller".to_owned(),
@@ -183,5 +189,481 @@ async fn a_start_of_an_existing_row_runs_the_rows_input() {
             .unwrap();
         assert_eq!(result, "stored", "{id}");
     }
+    dbos.shutdown().await;
+}
+
+/// Non-finite floats survive the database natively: a step's output and a workflow's input and
+/// result are written as their names, and a replay and a client both read them back as floats.
+#[tokio::test]
+async fn non_finite_floats_round_trip_through_the_database() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("non-finite-app", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("extremes", {
+            let runs = Arc::clone(&runs);
+            move |low: f64| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let high = dbos::step("high", || async {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Ok::<f32, Error>(f32::INFINITY)
+                    })
+                    .await?;
+                    Ok::<(f64, f32, f64), Error>((low, high, f64::NAN))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow
+        .start(f64::NEG_INFINITY)
+        .await
+        .expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let (low, high, nan) = handle.result().await.expect("the workflow failed");
+    assert_eq!((low, high), (f64::NEG_INFINITY, f32::INFINITY));
+    assert!(nan.is_nan());
+
+    let stored: Option<String> = sqlx::query_scalar(
+        r#"SELECT output FROM "dbos"."workflow_output" WHERE workflow_uuid = $1"#,
+    )
+    .bind(&id)
+    .fetch_one(&db.pool().await)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some(r#"["-Infinity","Infinity","NaN"]"#));
+
+    // A fork from step 1 replays the step's recorded output rather than running it.
+    let forked = dbos
+        .fork::<(f64, f32, f64), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let (_, replayed, _) = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, f32::INFINITY);
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+
+    let client = client(&db).await;
+    let (low, _, nan) = client
+        .retrieve_workflow::<(f64, f32, f64), EngineOnly>(&id)
+        .result()
+        .await
+        .expect("the result did not read back");
+    assert_eq!(low, f64::NEG_INFINITY);
+    assert!(nan.is_nan());
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// A result `serde_json` cannot write: it has no spelling for a non-string map key.
+type TupleKeys = std::collections::BTreeMap<(u8, u8), u8>;
+
+/// **A result its encoding refuses is the workflow's error.** The body ran to its end, and running
+/// it again would compute the same value and be refused the same way, so the refusal is recorded:
+/// the row ends ERROR, and the caller, a replay of the same id and a client all read back the same
+/// [`Error::Serialization`] without the body running again.
+#[tokio::test]
+async fn a_result_its_encoding_refuses_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-result", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("tuple_keys", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<TupleKeys, Error>([((1, 2), 3)].into_iter().collect()) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "result" && message.contains("key must be a string")
+        )
+    };
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(status(&db, &id).await.as_deref(), Some("ERROR"));
+
+    let replayed = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+
+    let client = client(&db).await;
+    let read = client
+        .retrieve_workflow::<TupleKeys, EngineOnly>(&id)
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&read), "{read:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// An application error `serde_json` cannot write, for the same reason as [`TupleKeys`].
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("no keys fit")]
+struct BadKeys {
+    by_pair: TupleKeys,
+}
+
+/// **An error its encoding refuses is recorded as the refusal**, carrying what the error displayed,
+/// so the row ends ERROR rather than staying for recovery to run the body again; the caller and a
+/// replay of the same id read back the same [`Error::Serialization`].
+#[tokio::test]
+async fn an_error_its_encoding_refuses_is_recorded_as_the_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-error", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("bad_keys", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Err::<(), _>(Error::Application(BadKeys {
+                        by_pair: [((1, 2), 3)].into_iter().collect(),
+                    }))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error<BadKeys>| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "error"
+                    && message.contains("key must be a string")
+                    && message.contains("no keys fit")
+        )
+    };
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(status(&db, &id).await.as_deref(), Some("ERROR"));
+
+    let replayed = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
+}
+
+/// The `output` and `error` columns of a workflow's step, as recorded.
+async fn step_row(
+    db: &TestDatabase,
+    workflow_id: &str,
+    step_id: i32,
+) -> (Option<String>, Option<String>) {
+    sqlx::query_as(
+        r#"SELECT output, error FROM "dbos"."operation_outputs"
+           WHERE workflow_uuid = $1 AND function_id = $2"#,
+    )
+    .bind(workflow_id)
+    .bind(step_id)
+    .fetch_one(&db.pool().await)
+    .await
+    .unwrap()
+}
+
+/// **A step result its encoding refuses is the step's error**, recorded under the step's id. The
+/// body ran, side effects and all, so the position cannot be left for a replay to run it again: a
+/// workflow that handles the refusal and carries on is forked past the step, and the fork reads the
+/// same refusal back without entering the step's body.
+#[tokio::test]
+async fn a_step_result_its_encoding_refuses_is_recorded_as_the_steps_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-step-result", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("handles_it", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let refused = dbos::step("tuple_keys", || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<TupleKeys, Error>([((1, 2), 3)].into_iter().collect())
+                        }
+                    })
+                    .await;
+                    let (what, message) = match refused {
+                        Err(Error::Serialization { what, message, .. }) => {
+                            (what.into_owned(), message)
+                        }
+                        other => return Err(Error::Config(format!("not refused: {other:?}"))),
+                    };
+                    // Handled, and the workflow carries on past it.
+                    let after = dbos::step("after", || async { Ok::<_, Error>(7u32) }).await?;
+                    Ok::<_, Error>((what, message, after))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let first = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    let (what, message, after) = &first;
+    assert_eq!(what, "step result");
+    assert!(message.contains("key must be a string"), "{message}");
+    assert_eq!(*after, 7);
+
+    let (output, error) = step_row(&db, &id, 0).await;
+    assert_eq!(output, None, "no output is recorded");
+    assert!(
+        error.is_some(),
+        "the refusal is recorded as the step's error"
+    );
+
+    // A fork from step 1 replays step 0 from its row: the same refusal, and no second run.
+    let forked = dbos
+        .fork::<(String, String, u32), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, first, "the replay took a different branch");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+
+    dbos.shutdown().await;
+}
+
+/// **A step error its encoding refuses is recorded as the refusal**, carrying what the error
+/// displayed. The body is handed that refusal on its first run too, not the error that could not
+/// be recorded, so it takes the same branch when a replay reads the refusal back.
+#[tokio::test]
+async fn a_step_error_its_encoding_refuses_is_recorded_as_the_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-step-error", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("handles_it", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let refused = dbos::step("bad_keys", || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Err::<(), _>(Error::Application(BadKeys {
+                                by_pair: [((1, 2), 3)].into_iter().collect(),
+                            }))
+                        }
+                    })
+                    .await;
+                    match refused {
+                        Err(Error::Serialization { what, message, .. }) => {
+                            Ok::<_, Error>((what.into_owned(), message))
+                        }
+                        other => Err(Error::Config(format!("not refused: {other:?}"))),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let first = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    let (what, message) = &first;
+    assert_eq!(what, "step error");
+    assert!(
+        message.contains("key must be a string") && message.contains("no keys fit"),
+        "{message}"
+    );
+
+    let (output, error) = step_row(&db, &id, 0).await;
+    assert_eq!(output, None, "no output is recorded");
+    assert!(
+        error.is_some(),
+        "the refusal is recorded as the step's error"
+    );
+
+    let forked = dbos
+        .fork::<(String, String), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, first, "the replay took a different branch");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+
+    dbos.shutdown().await;
+}
+
+/// **A step result its encoding refuses spends none of the step's retries.** The refusal comes
+/// after the body has run and is the same on every attempt, so the body runs once and the retry
+/// predicate is never asked about it.
+#[tokio::test]
+async fn a_step_result_its_encoding_refuses_is_not_retried() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-step-retry", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let asked = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("retries_it", {
+            let runs = Arc::clone(&runs);
+            let asked = Arc::clone(&asked);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                let asked = Arc::clone(&asked);
+                async move {
+                    let options = StepOptions {
+                        max_attempts: 5,
+                        interval: Duration::from_millis(1),
+                        max_interval: Duration::from_millis(2),
+                        ..Default::default()
+                    }
+                    .should_retry(move |_| {
+                        asked.fetch_add(1, Ordering::SeqCst);
+                        true
+                    });
+                    let refused = dbos::step_with("tuple_keys", options, || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<TupleKeys, Error>([((1, 2), 3)].into_iter().collect())
+                        }
+                    })
+                    .await;
+                    match refused {
+                        Err(Error::Serialization { what, .. }) => Ok::<_, Error>(what.into_owned()),
+                        other => Err(Error::Config(format!("not refused: {other:?}"))),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let what = tokio::time::timeout(DEADLINE, workflow.run(()))
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    assert_eq!(what, "step result");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the refusal was retried");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        0,
+        "the retry predicate was asked about the refusal"
+    );
+    dbos.shutdown().await;
+}
+
+/// **A step that spends its retries on errors the encoding refuses records the refusal of the
+/// whole.** The body's failures are retried as any are; the [`Error::MaxStepRetriesExceeded`] that
+/// ends them holds those errors and is refused with them, so it is recorded as a refusal of the
+/// step's error, and a fork reads that back without running the body again.
+#[tokio::test]
+async fn retries_spent_on_refused_errors_are_recorded_as_the_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-step-retries", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("spends_them", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let options = StepOptions {
+                        max_attempts: 2,
+                        interval: Duration::from_millis(1),
+                        max_interval: Duration::from_millis(2),
+                        ..Default::default()
+                    };
+                    let refused = dbos::step_with("bad_keys", options, || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Err::<(), _>(Error::Application(BadKeys {
+                                by_pair: [((1, 2), 3)].into_iter().collect(),
+                            }))
+                        }
+                    })
+                    .await;
+                    match refused {
+                        Err(Error::Serialization { what, message, .. }) => {
+                            Ok::<_, Error>((what.into_owned(), message))
+                        }
+                        other => Err(Error::Config(format!("not refused: {other:?}"))),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let first = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    let (what, message) = &first;
+    assert_eq!(what, "step error");
+    assert!(message.contains("key must be a string"), "{message}");
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "both attempts ran");
+
+    let forked = dbos
+        .fork::<(String, String), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, first, "the replay took a different branch");
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "the step ran again");
+
     dbos.shutdown().await;
 }

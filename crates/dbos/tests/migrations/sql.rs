@@ -536,6 +536,59 @@ async fn migration_121_adds_a_32_bit_consumer_step_column() {
     assert_eq!(data_type, "integer");
 }
 
+/// Migration 122 builds the workflow-timeout sweep's index: valid, keyed on the deadline alone,
+/// and partial over the unsettled statuses with a deadline, on both backends.
+///
+/// The sweep's plan depends on the predicate: its status literals and its `IS NOT NULL` have to be
+/// ones the planner can prove from the sweep's own `WHERE`.
+#[tokio::test]
+async fn migration_122_builds_the_deadline_index() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    dbos::sysdb::migrations::runner::run(&pool, schema, true)
+        .await
+        .expect("migration failed");
+
+    let definition: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = $1 \
+         AND tablename = 'workflow_status' AND indexname = 'idx_workflow_status_deadline'",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .expect("idx_workflow_status_deadline is missing");
+    let valid: bool = sqlx::query_scalar(
+        "SELECT ix.indisvalid FROM pg_index ix \
+         JOIN pg_class i ON i.oid = ix.indexrelid \
+         JOIN pg_namespace n ON n.oid = i.relnamespace \
+         WHERE n.nspname = $1 AND i.relname = 'idx_workflow_status_deadline'",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to read the index's validity");
+    assert!(valid, "the index is invalid: {definition}");
+
+    let (keys, included) = index_columns(&definition);
+    assert_eq!(keys, ["workflow_deadline_epoch_ms"], "{definition}");
+    assert!(included.is_empty(), "{definition}");
+    let (_, condition) = definition
+        .split_once(" WHERE ")
+        .unwrap_or_else(|| panic!("the index should be partial: {definition}"));
+    for fragment in [
+        "ENQUEUED",
+        "PENDING",
+        "DELAYED",
+        "workflow_deadline_epoch_ms IS NOT NULL",
+    ] {
+        assert!(
+            condition.contains(fragment),
+            "the predicate lacks {fragment}: {definition}"
+        );
+    }
+}
+
 /// Migrations 43 and 44 leave only the notifications trigger behind.
 ///
 /// Migration 1 installs notification and workflow-events triggers and 39 adds the streams
@@ -797,4 +850,48 @@ async fn application_version_indexes_have_the_shared_keys() {
         assert_eq!(keys, expected, "{name}");
         assert!(included.is_empty(), "{name} must use plain key columns");
     }
+}
+
+/// Migration 123 adds `creator_xid`, a nullable text column with no default value, and applying
+/// it twice is harmless.
+#[tokio::test]
+async fn migration_123_adds_the_creator_token_column() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    dbos::sysdb::migrations::runner::run(&pool, schema, true)
+        .await
+        .expect("migration failed");
+
+    let (data_type, nullable, default): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT data_type, is_nullable, column_default FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'workflow_status' \
+           AND column_name = 'creator_xid'",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .expect("creator_xid is missing");
+    assert_eq!(data_type, "text");
+    assert_eq!(nullable, "YES");
+    assert!(
+        default
+            .as_deref()
+            .is_none_or(|default| default.eq_ignore_ascii_case("NULL")),
+        "creator_xid defaults to {default:?}"
+    );
+
+    let statement = dbos::sysdb::migrations::SOURCES
+        .iter()
+        .find(|source| source.version == 123)
+        .expect("migration 123 is registered")
+        .sql
+        .replace(
+            "{{schema}}",
+            &dbos::sysdb::migrations::quote_identifier(schema),
+        );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+        .execute(&pool)
+        .await
+        .expect("applying migration 123 again failed");
 }

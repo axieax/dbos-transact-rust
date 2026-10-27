@@ -12,7 +12,7 @@ use dbos::{
     StartOptions, Timeout,
 };
 
-use dbos_test_support::{TestDatabase, test_database};
+use dbos_test_support::{Backend, TestDatabase, owner_token, test_database};
 
 /// The version each instance in this file launches with, derived from its application name.
 ///
@@ -251,6 +251,176 @@ async fn a_start_dropped_after_it_begins_still_starts_the_child() {
     dbos.shutdown().await;
 }
 
+/// A start dropped by a parent that then finishes still starts the child, however slow the start.
+///
+/// **A start writes under its parent's owner token, and a parent recording its outcome gives the
+/// token up**, so a start still in flight when its parent finished would be refused and lose the
+/// child: nothing awaits the dropped start to hear about it, and nothing records it. The parent
+/// therefore waits for its starts before it records its outcome.
+///
+/// Forced rather than raced: the test holds `operation_outputs` locked, which stops the start at
+/// its first read and leaves the parent's outcome write — to `workflow_status` alone — free to go
+/// ahead. A parent that recorded its outcome while its start waited would do it here at once.
+#[tokio::test]
+async fn a_start_dropped_by_a_parent_that_then_finishes_still_starts_the_child() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let db = test_database().await;
+    if db.backend() == Backend::Cockroach {
+        // The lock that stalls the start is Postgres's `LOCK TABLE`, and what this checks — the
+        // parent waiting for its starts — is the same on both backends.
+        return;
+    }
+    let dbos = DBOS::new(config("outlived-start-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let mut start = child.start(21);
+                    // One poll reaches the spawn and no further; see the test above.
+                    assert!(matches!(
+                        Pin::new(&mut start).poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Pending
+                    ));
+                    drop(start);
+                    // Nothing after it: a step would write to the locked table and wait too.
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let pool = db.pool().await;
+    let mut lock = pool.begin().await.expect("begin failed");
+    sqlx::query("LOCK TABLE dbos.operation_outputs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock failed");
+
+    let id = "the-outlived-parent";
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start");
+
+    // Long enough for a parent that does not wait to record its outcome many times over.
+    let reader = reader(&db).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let row = reader.get_workflow(id).await.expect("read failed");
+        assert_ne!(
+            row.map(|row| row.status),
+            Some(WorkflowStatus::Success),
+            "the parent recorded its outcome while its start was still in flight",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    lock.rollback().await.expect("unlock failed");
+
+    assert_eq!(handle.result().await.expect("the parent failed"), 1);
+    let child_id = format!("{id}-0");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(row) = reader.get_workflow(&child_id).await.expect("read failed")
+            && row.status == WorkflowStatus::Success
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the start the parent outlived never produced a finished child",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    dbos.shutdown().await;
+}
+
+/// A parent waiting for a stalled start still times out at its deadline.
+///
+/// The wait for the parent's starts runs inside its deadline, so a start that cannot finish does
+/// not hold the parent open past it: the parent is cancelled as any other would be, and its caller
+/// hears so while the start is still stalled. Stalled the same way as the test above.
+#[tokio::test]
+async fn a_parent_waiting_for_a_stalled_start_still_times_out() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let db = test_database().await;
+    if db.backend() == Backend::Cockroach {
+        // `LOCK TABLE` is Postgres's; the deadline it is checked against is the same on both.
+        return;
+    }
+    let dbos = DBOS::new(config("stalled-start-timeout-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let mut start = child.start(21);
+                    assert!(matches!(
+                        Pin::new(&mut start).poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Pending
+                    ));
+                    drop(start);
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let pool = db.pool().await;
+    let mut lock = pool.begin().await.expect("begin failed");
+    sqlx::query("LOCK TABLE dbos.operation_outputs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock failed");
+
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("the-stalled-parent"),
+                timeout: Timeout::Explicit(Duration::from_secs(1)),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start");
+
+    // Held until the parent's caller has its answer, so the start is still stalled when it does.
+    let result = tokio::time::timeout(Duration::from_secs(20), handle.result())
+        .await
+        .expect("the parent was held past its deadline by the start it was waiting for");
+    assert!(
+        matches!(result, Err(Error::WorkflowCancelled { .. })),
+        "expected the parent to time out, got {result:?}"
+    );
+    lock.rollback().await.expect("unlock failed");
+
+    dbos.shutdown().await;
+}
+
 /// A child that joins a held deduplication key is recorded as the workflow it joined.
 ///
 /// The interesting half is the start record. The child id this call derived — `{parent}-{step}` —
@@ -382,6 +552,389 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
             .expect("the holder never ran")
             .expect("the holder failed"),
         9
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A deduplicated child start's error is recorded at the parent's step, and replays the same.**
+///
+/// The key is held only while its holder waits, so a replay after the holder has finished would
+/// otherwise start the child and take the branch the first run didn't. The parent handles the
+/// error; the holder then finishes; a fork that copies the start's checkpoint still takes the
+/// error branch and creates no child. A fork that runs the start again, as a control, starts the
+/// child, which shows the key really is free by then.
+#[tokio::test]
+async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-dedup-error-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let started = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    deduplication_id: Some("order-7"),
+                                    ..Enqueue::new("dedup-error-queue")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    match started {
+                        Ok(handle) => Ok::<_, Error>(format!("started {}", handle.result().await?)),
+                        Err(
+                            e @ Error::SystemDatabase(dbos::sysdb::Error::QueueDeduplicated {
+                                ..
+                            }),
+                        ) => Ok(format!("deduplicated: {e}")),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // **Enqueued before the queue is registered, which is what keeps the key held.** Nothing polls
+    // a queue until it is registered, so the holder waits, holding the key, for as long as the
+    // parent's first run takes.
+    let holder = child
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("the-dedup-holder"),
+                queue: Some(Enqueue {
+                    deduplication_id: Some("order-7"),
+                    ..Enqueue::new("dedup-error-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the holder was not enqueued");
+
+    let id = "the-deduplicated-parent";
+    let first = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert!(first.starts_with("deduplicated: "), "{first}");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "child");
+    assert!(
+        steps[0].error.is_some() && steps[0].child_workflow_id.is_none(),
+        "the error is recorded as the start's, with no child: {:?}",
+        steps[0]
+    );
+
+    // Registering the queue lets the holder run, and its finishing frees the key.
+    dbos.register_queue(
+        "dedup-error-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), holder.result())
+            .await
+            .expect("the holder never ran")
+            .expect("the holder failed"),
+        9
+    );
+
+    // The key is free now. A fork from step 1 copies the start's checkpoint, so the start replays
+    // and must return the first run's error again rather than start the child: the same variant
+    // and fields, so it still names the first run's derived child id.
+    let replayed = dbos
+        .fork::<String, Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed_id = replayed.workflow_id().to_owned();
+    assert_eq!(
+        replayed.result().await.expect("the replay failed"),
+        first,
+        "the replay took a different branch from the run it replayed"
+    );
+    assert!(
+        reader
+            .get_workflow(&format!("{replayed_id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
+    );
+
+    // A fork from step 0 runs the start again, and with the key free it goes ahead.
+    let rerun = dbos
+        .fork::<String, Error>(id, 0)
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), rerun.result())
+            .await
+            .expect("the rerun never finished")
+            .expect("the rerun failed"),
+        "started 9"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A child start refused for a delay that carries it past the largest instant is recorded too**,
+/// and replays the same.
+///
+/// Whether the delay fits depends on the clock when the start runs, so a replay on a host whose
+/// clock is behind could go ahead with the start the first run refused. The delay is shared with
+/// the test and shortened before the replay, standing in for that clock: a fork that copies the
+/// start's checkpoint still takes the refused branch and creates no child, and a fork that runs the
+/// start again, as a control, starts the child.
+#[tokio::test]
+async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_would_fit() {
+    use std::sync::atomic::AtomicU64;
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-delay-error-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    // Fits in milliseconds, so the start's own checks pass it, but no clock can add it to now.
+    let delay_ms = Arc::new(AtomicU64::new(i64::MAX as u64));
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            let delay_ms = Arc::clone(&delay_ms);
+            move |()| {
+                let child = child.clone();
+                let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
+                async move {
+                    let started = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    delay: Some(delay),
+                                    ..Enqueue::new("delay-error-queue")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    match started {
+                        Ok(handle) => Ok::<_, Error>(format!("started {}", handle.workflow_id())),
+                        Err(e @ Error::InvalidArgument { .. }) => Ok(format!("refused: {e}")),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-delay-refused-parent";
+    let first = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert!(
+        first.starts_with(
+            "refused: invalid argument to enqueue a workflow: queue `delay-error-queue`: `delay`"
+        ),
+        "{first}"
+    );
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "child");
+    assert!(
+        steps[0].error.is_some() && steps[0].child_workflow_id.is_none(),
+        "the refusal is recorded as the start's, with no child: {:?}",
+        steps[0]
+    );
+
+    delay_ms.store(60_000, Ordering::SeqCst);
+
+    // A fork from step 1 copies the start's checkpoint, so the start replays and must return the
+    // first run's refusal again rather than start the child with a delay that now fits.
+    let replayed = dbos
+        .fork::<String, Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed_id = replayed.workflow_id().to_owned();
+    assert_eq!(
+        replayed.result().await.expect("the replay failed"),
+        first,
+        "the replay took a different branch from the run it replayed"
+    );
+    assert!(
+        reader
+            .get_workflow(&format!("{replayed_id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
+    );
+
+    // A fork from step 0 runs the start again, and with a delay that fits it goes ahead.
+    let rerun = dbos
+        .fork::<String, Error>(id, 0)
+        .await
+        .expect("fork failed");
+    let rerun_id = rerun.workflow_id().to_owned();
+    assert_eq!(
+        rerun.result().await.expect("the rerun failed"),
+        format!("started {rerun_id}-0")
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A child id taken by another function is a recorded error too**, and a parent that returns it
+/// with `?` ends `ERROR` with it, on the first run and on the replay.
+///
+/// The conflict lasts only as long as the other workflow's row. Once that row is deleted the same
+/// start would go ahead, so a replay that didn't read the record would start the child and
+/// end in success.
+#[tokio::test]
+async fn a_child_id_taken_by_another_function_replays_its_error_after_the_row_is_deleted() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-conflict-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    let squatter = dbos
+        .register_workflow("squatter", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                workflow_id: Some("the-taken-child-id"),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await?
+                        .result()
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    squatter
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("the-taken-child-id"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the squatter failed");
+
+    let id = "the-conflicting-parent";
+    let first = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start")
+        .result()
+        .await
+        .expect_err("the parent should end with the error");
+    assert!(
+        matches!(
+            first,
+            Error::SystemDatabase(dbos::sysdb::Error::ConflictingWorkflow { .. })
+        ),
+        "{first:?}"
+    );
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the parent is missing")
+            .status,
+        WorkflowStatus::Error,
+        "a recorded start error returned with `?` is the workflow's outcome"
+    );
+
+    // With the squatter gone the id is free, so only the record keeps the replay failing.
+    dbos.delete("the-taken-child-id")
+        .await
+        .expect("delete failed");
+    let fork = dbos.fork::<u32, Error>(id, 1).await.expect("fork failed");
+    let fork_id = fork.workflow_id().to_owned();
+    let replayed = fork
+        .result()
+        .await
+        .expect_err("the replay should end with the error");
+    assert_eq!(
+        replayed.to_string(),
+        first.to_string(),
+        "the replay ended differently from the run it replayed"
+    );
+    assert_eq!(
+        reader
+            .get_workflow(&fork_id)
+            .await
+            .expect("read failed")
+            .expect("the fork is missing")
+            .status,
+        WorkflowStatus::Error,
+        "the replay's recorded start error is its outcome too"
+    );
+    assert!(
+        reader
+            .get_workflow("the-taken-child-id")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
     );
 
     dbos.shutdown().await;
@@ -1471,8 +2024,8 @@ async fn a_child_can_decline_the_inherited_deadline() {
 /// **The propagated deadline is the cascade.** A parent that runs out of time and the child that
 /// inherited its deadline are cancelled at the same instant, independently.
 ///
-/// Nothing signals the child. It holds the same instant, its own `select!` fires on it, and it
-/// writes its own `CANCELLED`. That is why deadlines need no cancellation cascade: there is
+/// Nothing signals the child. It holds the same instant, its own timer fires on it, and it records
+/// its own timeout. That is why deadlines need no cancellation cascade: there is
 /// nothing left for one to do. (An explicit `cancel` with children is a different question, and
 /// belongs to the management surface.)
 #[tokio::test]
@@ -1599,7 +2152,15 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
     // The row exists as soon as `start_with` returns, which is what this write needs.
     let reader = reader(&db).await;
     reader
-        .record_step(id, 0, "child", Outcome::Output(Some("1")), None, None)
+        .record_step(
+            id,
+            0,
+            "child",
+            Outcome::Output(Some("1")),
+            None,
+            None,
+            &owner_token(&reader, id).await,
+        )
         .await
         .expect("planting the step failed");
     tx.send(()).expect("the parent is waiting on the gate");
@@ -1634,6 +2195,108 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
             .is_none(),
         "no child row was created before the refusal"
     );
+
+    dbos.shutdown().await;
+}
+
+/// A child start whose timeout or delay the row cannot hold is refused before it takes a step id.
+///
+/// The same goes for a zero timeout or delay, which no row can carry either. All of them are
+/// refused with the start's other argument checks, ahead of the placement, so the
+/// parent's counter does not move: the step written after them takes the id the first start would
+/// have had, and no child row is created under any derived id.
+#[tokio::test]
+async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refused-duration-child-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                // Too long to store, and zero: neither is a timeout or delay a row can carry.
+                for duration in [Duration::MAX, Duration::ZERO] {
+                    let refused = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                timeout: Timeout::Explicit(duration),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                            if operation == "start a workflow" && detail.contains("`timeout`")),
+                        "a timeout of {duration:?} should be refused, got {:?}",
+                        refused.map(|_| ())
+                    );
+
+                    let refused = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    delay: Some(duration),
+                                    ..Enqueue::new("never-reached")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                            if operation == "enqueue a workflow" && detail.contains("`delay`")),
+                        "a delay of {duration:?} should be refused, got {:?}",
+                        refused.map(|_| ())
+                    );
+                }
+
+                dbos::step("after", || async { Ok(()) }).await?;
+                Ok::<u32, Error>(1)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "refuses-its-children";
+    parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "after")],
+        "a refused start took the step id the step after it should have had",
+    );
+    for child_id in (0..4).map(|step| format!("{id}-{step}")) {
+        assert!(
+            reader
+                .get_workflow(&child_id)
+                .await
+                .expect("read failed")
+                .is_none(),
+            "a refused start created {child_id}"
+        );
+    }
 
     dbos.shutdown().await;
 }
@@ -1856,6 +2519,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
             Outcome::Output(Some("7")),
             None,
             None,
+            &owner_token(&reader, id).await,
         )
         .await
         .expect("planting the await failed");

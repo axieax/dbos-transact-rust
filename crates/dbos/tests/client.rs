@@ -16,8 +16,8 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, ForkOptions, Message, QueueChange, QueueConflict, QueueOptions,
-    SendOptions, StartOptions, WorkflowHandle,
+    EnqueueOptions, Error, Fork, ForkOptions, QueueChange, QueueConflict, QueueOptions,
+    SendMessage, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -54,6 +54,89 @@ fn config(app_name: &str, db: &TestDatabase) -> Config {
 /// A second handle on the database, for reading what a call actually wrote.
 async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
     PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default())
+}
+
+/// A client enqueue whose timeout or delay the row cannot hold is refused before it writes one.
+#[tokio::test]
+async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
+    let db = test_database().await;
+    let client = client("client-unstorable", &db).await;
+
+    let cases = [
+        (
+            "refused-timeout",
+            EnqueueOptions {
+                workflow_id: Some("refused-timeout"),
+                timeout: Some(Duration::MAX),
+                ..EnqueueOptions::new("work")
+            },
+            "`timeout`",
+        ),
+        (
+            "refused-delay",
+            EnqueueOptions {
+                workflow_id: Some("refused-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::MAX),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay`",
+        ),
+        (
+            // Fits in milliseconds, so it passes the checks made before anything is written, and
+            // is refused by the insert, which alone knows the clock it would be added to.
+            "overflowing-delay",
+            EnqueueOptions {
+                workflow_id: Some("overflowing-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::from_millis(i64::MAX as u64)),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay`",
+        ),
+        (
+            "zero-timeout",
+            EnqueueOptions {
+                workflow_id: Some("zero-timeout"),
+                timeout: Some(Duration::ZERO),
+                ..EnqueueOptions::new("work")
+            },
+            "`timeout` must be a positive, non-zero duration",
+        ),
+        (
+            "zero-delay",
+            EnqueueOptions {
+                workflow_id: Some("zero-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::ZERO),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay` must be a positive, non-zero duration",
+        ),
+    ];
+    for (id, options, expected) in cases {
+        let refused = client
+            .enqueue_with::<_, (), EngineOnly>("never_registered", (), options)
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                if operation == "enqueue a workflow" && detail.contains(expected)),
+            "{id}: expected a refusal mentioning {expected}, got {:?}",
+            refused.map(|_| ())
+        );
+        assert!(
+            reader(&db)
+                .await
+                .get_workflow(id)
+                .await
+                .expect("read failed")
+                .is_none(),
+            "{id}: a refused enqueue wrote a row"
+        );
+    }
 }
 
 /// The client hands work over and the application runs it — the whole point of the surface.
@@ -121,7 +204,7 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
     assert_eq!(row.queue_name.as_deref(), Some("work"));
     assert_eq!(row.input.as_deref(), Some("\"payload\""));
     assert_eq!(
-        row.application_name.as_deref(),
+        row.app_name.as_deref(),
         Some("client-rows"),
         "a named client owns what it writes"
     );
@@ -130,7 +213,7 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
         "a client claims nothing: the executor that dequeues it stamps its own id"
     );
     assert_eq!(
-        row.application_version, None,
+        row.app_version, None,
         "a client has no version of its own to pin the row to"
     );
     assert_eq!(row.priority, 0, "unprioritised is stored as the sentinel");
@@ -184,11 +267,11 @@ async fn every_option_reaches_the_row() {
     assert_eq!(row.class_name.as_deref(), Some("Billing"));
     assert_eq!(row.config_name.as_deref(), Some("eu"));
     assert_eq!(
-        row.application_name.as_deref(),
+        row.app_name.as_deref(),
         Some("some-other-app"),
         "an enqueue may hand work to an application this client is not"
     );
-    assert_eq!(row.application_version.as_deref(), Some("v1.2.3"));
+    assert_eq!(row.app_version.as_deref(), Some("v1.2.3"));
     assert_eq!(row.timeout, Some(Duration::from_secs(90)));
     assert_eq!(
         row.deadline, None,
@@ -230,7 +313,7 @@ async fn a_nameless_client_writes_unclaimed_rows() {
         .await
         .expect("read failed")
         .expect("the row is missing");
-    assert_eq!(row.application_name, None);
+    assert_eq!(row.app_name, None);
 
     client.close().await;
 }
@@ -366,8 +449,56 @@ async fn returning_the_existing_workflow_needs_a_key() {
         )
         .await
         .expect_err("there is no collision to resolve without a deduplication id");
-    assert!(matches!(error, Error::Config(_)), "{error}");
+    assert!(
+        matches!(&error, Error::InvalidArgument { operation, .. } if operation == "enqueue a workflow"),
+        "{error}"
+    );
     assert!(error.to_string().contains("deduplication_id"), "{error}");
+
+    client.close().await;
+}
+
+/// A value only the insert checks is refused as the enqueue's argument, named as the API spells
+/// it rather than by its column.
+#[tokio::test]
+async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
+    let db = test_database().await;
+    let client = client("client-empty-values", &db).await;
+
+    let cases = [
+        (
+            EnqueueOptions::on(Enqueue {
+                deduplication_id: Some(""),
+                ..Enqueue::new("work")
+            }),
+            "queue `work`: `deduplication_id` must be absent rather than empty",
+        ),
+        (
+            EnqueueOptions::on(Enqueue {
+                partition_key: Some(""),
+                ..Enqueue::new("work")
+            }),
+            "queue `work`: `partition_key` must be absent rather than empty",
+        ),
+        (
+            EnqueueOptions {
+                app_version: Some(""),
+                ..EnqueueOptions::new("work")
+            },
+            "queue `work`: `app_version` must be absent rather than empty",
+        ),
+    ];
+    for (options, expected) in cases {
+        let refused = client
+            .enqueue_with::<_, (), EngineOnly>("never_registered", (), options)
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                if operation == "enqueue a workflow" && detail == expected),
+            "expected {expected:?}, got {:?}",
+            refused.map(|_| ())
+        );
+    }
 
     client.close().await;
 }
@@ -392,7 +523,10 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
         )
         .await
         .expect_err("a priority of 0 was accepted");
-    assert!(matches!(error, Error::Config(_)), "{error}");
+    assert!(
+        matches!(&error, Error::InvalidArgument { operation, .. } if operation == "enqueue a workflow"),
+        "{error}"
+    );
 
     assert!(
         reader(&db)
@@ -468,25 +602,24 @@ async fn a_message_waits_for_its_destination() {
 
     client
         .send_with(
-            &id,
-            &"approved",
-            SendOptions {
+            SendMessage {
                 topic: Some("approvals"),
-                ..Default::default()
+                ..SendMessage::new(&id, &"approved")
             },
+            SendOptions::default(),
         )
         .await
         .expect("send failed");
-    let once = SendOptions {
+    let once = SendMessage {
         idempotency_key: Some("once"),
-        ..Default::default()
+        ..SendMessage::new(&id, &"only once")
     };
     client
-        .send_with(&id, &"only once", once)
+        .send_with(once, SendOptions::default())
         .await
         .expect("send failed");
     client
-        .send_with(&id, &"only once", once)
+        .send_with(once, SendOptions::default())
         .await
         .expect("a resend under a held key is a no-op, not an error");
 
@@ -530,9 +663,9 @@ async fn a_batch_of_messages_lands_together() {
 
     client
         .send_bulk(&[
-            Message::new(&first, &"one"),
-            Message::new(&second, &"two"),
-            Message::new(&first, &"three"),
+            SendMessage::new(&first, &"one"),
+            SendMessage::new(&second, &"two"),
+            SendMessage::new(&first, &"three"),
         ])
         .await
         .expect("send failed");
@@ -559,8 +692,8 @@ async fn a_batch_of_messages_lands_together() {
     // insert, which is the guarantee a batch buys over a loop of sends.
     let error = client
         .send_bulk(&[
-            Message::new(&first, &"four"),
-            Message::new("no-such-workflow", &"five"),
+            SendMessage::new(&first, &"four"),
+            SendMessage::new("no-such-workflow", &"five"),
         ])
         .await
         .expect_err("a message addressed to nothing should fail");
@@ -849,10 +982,7 @@ async fn a_client_reads_application_versions() {
     dbos.launch().await.expect("launch failed");
 
     let client = client("client-versions", &db).await;
-    let versions = client
-        .list_application_versions()
-        .await
-        .expect("list failed");
+    let versions = client.list_app_versions().await.expect("list failed");
     assert_eq!(
         versions
             .iter()
@@ -862,7 +992,7 @@ async fn a_client_reads_application_versions() {
     );
     assert_eq!(
         client
-            .latest_application_version()
+            .latest_app_version()
             .await
             .expect("read failed")
             .expect("a version was registered at launch")
@@ -896,7 +1026,7 @@ async fn a_client_promotes_an_older_version_to_roll_a_deploy_back() {
     let client = client("client-promote", &db).await;
     let latest = async || {
         client
-            .latest_application_version()
+            .latest_app_version()
             .await
             .expect("read failed")
             .expect("a version was registered at launch")
@@ -905,14 +1035,14 @@ async fn a_client_promotes_an_older_version_to_roll_a_deploy_back() {
     assert_eq!(latest().await, "v2", "the newer deployment is the latest");
 
     client
-        .set_latest_application_version("v1")
+        .set_latest_app_version("v1")
         .await
         .expect("promote failed");
     assert_eq!(latest().await, "v1", "promoting rolls the fleet back");
 
     // Promotion moves a timestamp; it registers nothing.
     let mut names = client
-        .list_application_versions()
+        .list_app_versions()
         .await
         .expect("list failed")
         .into_iter()
@@ -951,7 +1081,7 @@ async fn a_client_promotes_a_version_for_a_named_application() {
     let peer = client("promote-peer", &db).await;
     let latest = async |client: &dbos::Client| {
         client
-            .latest_application_version()
+            .latest_app_version()
             .await
             .expect("read failed")
             .expect("a version was registered at launch")
@@ -961,13 +1091,13 @@ async fn a_client_promotes_a_version_for_a_named_application() {
     // Unnamed, the call is scoped to this client's own application, so a peer's version is not its
     // to move.
     assert!(
-        own.set_latest_application_version("p1").await.is_err(),
+        own.set_latest_app_version("p1").await.is_err(),
         "promoting a peer's version without naming the peer should be refused"
     );
     assert_eq!(latest(&peer).await, "p2", "the refusal moved nothing");
 
     // Naming the peer is what makes it legal.
-    own.set_latest_application_version_for("p1", "promote-peer")
+    own.set_latest_app_version_for("p1", "promote-peer")
         .await
         .expect("promote failed");
     assert_eq!(latest(&peer).await, "p1", "the peer rolled back");
@@ -1165,8 +1295,7 @@ async fn a_client_forks_a_workflow_the_application_then_runs() {
     let client = client("client-fork", &db).await;
     let fork = client
         .fork_with::<u32, EngineOnly>(
-            source,
-            0,
+            Fork::new(source, 0),
             ForkOptions {
                 app_version: Some(APP_VERSION),
                 ..ForkOptions::default()
@@ -1182,31 +1311,31 @@ async fn a_client_forks_a_workflow_the_application_then_runs() {
     assert_eq!(fork.result().await.expect("the fork failed"), 9);
     assert_eq!(ran.load(Ordering::SeqCst), 2, "the fork did not run");
 
-    client.close().await;
-    dbos.shutdown().await;
-}
-
-/// A chosen id names one fork, so the bulk form refuses it — the same refusal `DBOS::fork_all`
-/// makes, checked here because it is the one rule this surface enforces before any I/O.
-#[tokio::test]
-async fn a_clients_bulk_fork_refuses_a_chosen_id() {
-    let db = test_database().await;
-    let client = client("client-fork-refusal", &db).await;
-
-    let error = client
+    // The bulk form names its forks per source.
+    let named = client
         .fork_all::<u32, EngineOnly>(
-            &["a", "b"],
-            0,
+            &[Fork {
+                forked_id: Some("client-named-fork"),
+                ..Fork::new(source, 0)
+            }],
             ForkOptions {
-                forked_id: Some("only-one-of-me"),
+                app_version: Some(APP_VERSION),
                 ..ForkOptions::default()
             },
         )
         .await
-        .expect_err("one id cannot name two forks");
-    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
+        .expect("bulk fork failed");
+    assert_eq!(
+        named.iter().map(|h| h.workflow_id()).collect::<Vec<_>>(),
+        ["client-named-fork"],
+    );
+    for fork in named {
+        assert_eq!(fork.result().await.expect("the named fork failed"), 9);
+    }
+    assert_eq!(ran.load(Ordering::SeqCst), 3, "the named fork did not run");
 
     client.close().await;
+    dbos.shutdown().await;
 }
 
 /// A negative step is refused before any I/O, on the single and the bulk form — the same refusal
@@ -1226,13 +1355,52 @@ async fn a_clients_fork_refuses_a_negative_step() {
         "{error:?}"
     );
     let error = client
-        .fork_all::<u32, EngineOnly>(&["has-a-step"], -1, ForkOptions::default())
+        .fork_all::<u32, EngineOnly>(&[Fork::new("has-a-step", -1)], ForkOptions::default())
         .await
         .expect_err("a negative step was accepted in bulk");
     assert!(
         matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
         "{error:?}"
     );
+
+    client.close().await;
+}
+
+/// A batch with two forks under one id, an empty forked id or an empty original id is refused
+/// before any I/O — neither source exists, so reaching the database would fail differently.
+#[tokio::test]
+async fn a_clients_bulk_fork_refuses_invalid_forks() {
+    let db = test_database().await;
+    let client = client("client-fork-invalid", &db).await;
+
+    let twice = Fork {
+        forked_id: Some("chosen-twice"),
+        ..Fork::new("a", 0)
+    };
+    let empty_forked_id = Fork {
+        forked_id: Some(""),
+        ..Fork::new("b", 0)
+    };
+    for forks in [
+        [
+            twice,
+            Fork {
+                original_id: "b",
+                ..twice
+            },
+        ],
+        [Fork::new("a", 0), empty_forked_id],
+        [Fork::new("a", 0), Fork::new("", 0)],
+    ] {
+        let error = client
+            .fork_all::<u32, EngineOnly>(&forks, ForkOptions::default())
+            .await
+            .expect_err("an invalid batch was accepted");
+        assert!(
+            matches!(error, Error::InvalidArgument { .. }),
+            "{forks:?}: {error:?}"
+        );
+    }
 
     client.close().await;
 }
@@ -1363,6 +1531,19 @@ async fn a_client_lists_tags_and_delays_workflows() {
         .set_workflow_delay(id, dbos::WorkflowDelay::For(Duration::ZERO))
         .await
         .expect("delay failed");
+
+    // A delay whose release instant cannot be stored is refused by the system database, and
+    // reported as an argument refusal: too long to be milliseconds at all, or fitting but carrying
+    // the clock past the largest instant.
+    for delay in [Duration::MAX, Duration::from_millis(i64::MAX as u64)] {
+        let refused = client
+            .set_workflow_delay(id, dbos::WorkflowDelay::For(delay))
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail.contains("`delay`")),
+            "a delay of {delay:?} should be refused, got {refused:?}"
+        );
+    }
 
     client.close().await;
 }

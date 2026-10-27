@@ -29,16 +29,16 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepPlacement, revive};
+use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter, revive};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::SerializationFormat;
-use crate::serialization::{PayloadEncoding, decode_tagged, encode};
+use crate::serialization::{PORTABLE_JSON, PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{
     AwaitedStream, EncodedValue, Outcome, StepTiming, Timestamp, WrittenBy, step_names,
 };
-use crate::sysdb::{STREAM_CLOSED, STREAM_CLOSED_SERIALIZATION, is_stream_closed};
+use crate::sysdb::{STREAM_CLOSED, is_stream_closed};
 
 /// How long a reader waits before looking again when nothing wakes it, unless
 /// [`ReadStreamOptions::polling_interval`] says otherwise.
@@ -134,7 +134,7 @@ where
 enum StreamWrite<'v, T> {
     /// A value, and the encoding asked for it.
     Value(&'v T, SerializationFormat),
-    /// The close, whose encoding is fixed — see [`STREAM_CLOSED_SERIALIZATION`].
+    /// The close, whose encoding is fixed: [`STREAM_CLOSED`] under [`PORTABLE_JSON`].
     Close,
 }
 
@@ -187,14 +187,18 @@ where
     PendingStep::placed(name, built, move |(conn, encoded), placement| async move {
         // A step id of the workflow's own when written from its body; the enclosing step's id when
         // written from inside one, where the write records nothing and the column is all it gets.
-        let (workflow_id, step_id, written_by) = match &placement {
-            StepPlacement::Recorded { ctx, step_id } => {
-                (ctx.workflow_id(), *step_id, WrittenBy::Workflow)
-            }
+        let (workflow_id, step_id, owner_xid, written_by) = match &placement {
+            StepPlacement::Recorded { ctx, step_id } => (
+                ctx.workflow_id(),
+                *step_id,
+                ctx.owner_xid(),
+                WrittenBy::Workflow,
+            ),
             StepPlacement::InsideStep { ctx } => (
                 ctx.workflow_id(),
                 ctx.step_id()
                     .expect("a context inside a step knows its step id"),
+                ctx.owner_xid(),
                 WrittenBy::Step,
             ),
             StepPlacement::Outside | StepPlacement::ClientConnection => {
@@ -212,12 +216,13 @@ where
                         value,
                         Some(encoding.name()),
                         written_by,
+                        owner_xid,
                     )
                     .await
             }
             None => {
                 sysdb
-                    .close_stream(workflow_id, step_id, key, written_by)
+                    .close_stream(workflow_id, step_id, key, written_by, owner_xid)
                     .await
             }
         }
@@ -616,7 +621,7 @@ where
                     return Ok(None);
                 }
                 // Ids are taken in order, so once one has no record, none after it does.
-                None => self.replaying = placement.step().is_none(),
+                None => self.replaying = placement.step_position().is_none(),
             }
         }
 
@@ -972,7 +977,7 @@ async fn record_end(
         placement,
         name,
         Outcome::Output(Some(STREAM_CLOSED)),
-        Some(STREAM_CLOSED_SERIALIZATION),
+        Some(PORTABLE_JSON),
         started_at,
     )
     .await
@@ -995,7 +1000,12 @@ async fn record(
     serialization: Option<&str>,
     started_at: Timestamp,
 ) -> Result<()> {
-    let Some((workflow_id, step_id)) = placement.step() else {
+    let Some(StepWriter {
+        workflow_id,
+        step_id,
+        owner_xid,
+    }) = placement.step_writer()
+    else {
         return Ok(());
     };
     conn.sysdb()
@@ -1009,6 +1019,7 @@ async fn record(
                 started_at,
                 completed_at: Timestamp::now(),
             }),
+            owner_xid,
         )
         .await
         .map_err(Error::SystemDatabase)

@@ -33,7 +33,7 @@
 
 use super::Error;
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// An instant, as epoch milliseconds.
@@ -122,6 +122,24 @@ impl Timestamp {
             .map(Self)
     }
 
+    /// This instant plus a duration the caller supplied, or [`Error::InvalidInput`] naming
+    /// `field` when the sum cannot be stored.
+    ///
+    /// [`checked_add`](Self::checked_add) for a value that is about to be written: a duration too
+    /// long for [`duration_to_ms`], or one that carries the instant past `i64::MAX` milliseconds,
+    /// is the caller's to hear about rather than a wrapped instant in a column.
+    pub fn try_add(self, field: &'static str, duration: Duration) -> Result<Self, Error> {
+        let ms = duration_to_ms(field, duration)?;
+        self.0
+            .checked_add(ms)
+            .map(Self)
+            .ok_or_else(|| Error::InvalidInput {
+                field: field.into(),
+                detail: "must not end past the latest instant 64-bit epoch milliseconds can hold"
+                    .to_owned(),
+            })
+    }
+
     /// How long after `earlier` this instant is, or `None` if it is not after it.
     pub fn duration_since(self, earlier: Self) -> Option<Duration> {
         self.0
@@ -196,6 +214,46 @@ pub fn duration_from_ms(ms: i64) -> Option<Duration> {
 /// it; `try_from_secs_f64` covers all four.
 pub fn duration_from_secs(secs: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(secs).ok()
+}
+
+/// Rejects a workflow or fork's delay or timeout that is zero, or too long to store as
+/// milliseconds, as [`Error::InvalidInput`] naming `field`.
+///
+/// The rule [`NewWorkflow::validate`] and [`ForkOptions::validate`] apply, kept in one place so
+/// the surfaces that start a workflow can refuse the same values before they take a step id. A
+/// zero delay is a caller that meant `None`, and a zero timeout would expire the workflow before
+/// it ran. Both are written as milliseconds: the timeout as itself, the delay as an instant
+/// resolved from it, so one that does not fit is refused rather than truncated into the column.
+///
+/// Neither rule reads a clock, so a surface can apply them before a step id is taken without a
+/// replay deciding differently from the first run.
+pub(crate) fn validate_positive_duration(
+    field: &'static str,
+    duration: Duration,
+) -> Result<(), Error> {
+    if duration.is_zero() {
+        return Err(Error::InvalidInput {
+            field: field.into(),
+            detail: "must be a positive, non-zero duration".to_owned(),
+        });
+    }
+    duration_to_ms(field, duration)?;
+    Ok(())
+}
+
+/// Converts a caller's duration to the integer milliseconds a column such as
+/// `workflow_timeout_ms` stores, or [`Error::InvalidInput`] naming `field` when it does not fit.
+///
+/// The inverse of [`duration_from_ms`], for the write side. `Duration::as_millis` is a `u128`, and
+/// narrowing it with `as` would store a truncated, possibly negative, value in place of the one
+/// the caller gave. Reported rather than saturated, for the reason stated on
+/// [`Timestamp::to_system_time`]: a value this layer cannot store is the caller's to hear about,
+/// not one to quietly replace with a different one.
+pub fn duration_to_ms(field: &'static str, duration: Duration) -> Result<i64, Error> {
+    i64::try_from(duration.as_millis()).map_err(|_| Error::InvalidInput {
+        field: field.into(),
+        detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
+    })
 }
 
 /// Where a workflow is in its lifecycle.
@@ -313,6 +371,10 @@ impl fmt::Display for WorkflowStatus {
 /// [`Error::Malformed`]: not a retryable class, raised on the
 /// replay path, so the workflow can never get past that step. Unknown fields are already
 /// tolerated, `serde` ignoring them by default, so the reverse direction needs nothing.
+///
+/// For the same reason a field spelled differently from its column — `app_version`, `app_id`,
+/// `app_name` — is serialized under the column's name, which is the key a recorded listing
+/// already holds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowRecord {
     /// Primary key, and the identity a caller uses everywhere else.
@@ -345,8 +407,8 @@ pub struct WorkflowRecord {
     #[serde(default)]
     pub executor_id: Option<String>,
     /// Application version that created it, used to keep recovery on compatible code.
-    #[serde(default)]
-    pub application_version: Option<String>,
+    #[serde(default, rename = "application_version")]
+    pub app_version: Option<String>,
     /// Recovery attempts so far, against the dead-letter limit.
     #[serde(default)]
     pub recovery_attempts: i64,
@@ -383,8 +445,8 @@ pub struct WorkflowRecord {
     #[serde(default)]
     pub owner_xid: Option<String>,
     /// Deployment identifier, for installations running several applications.
-    #[serde(default)]
-    pub application_id: Option<String>,
+    #[serde(default, rename = "application_id")]
+    pub app_id: Option<String>,
     /// User on whose behalf the workflow runs.
     #[serde(default)]
     pub authenticated_user: Option<String>,
@@ -405,8 +467,8 @@ pub struct WorkflowRecord {
     /// Unclaimed means no application has taken it — a row written before any implementation
     /// supported ownership, or by a handle with no application of its own. Every application may
     /// run it, and the first to dequeue it claims it.
-    #[serde(default)]
-    pub application_name: Option<String>,
+    #[serde(default, rename = "application_name")]
+    pub app_name: Option<String>,
 
     // ── Queueing ───────────────────────────────────────────────────────────────
     /// Deduplication key within the queue. At most one live workflow may hold a given key.
@@ -516,11 +578,14 @@ pub struct NewWorkflow<'a> {
     pub debounce_deadline: Option<Timestamp>,
 
     /// Wall-clock budget for the whole workflow.
+    ///
+    /// A workflow inserted `PENDING` with no `deadline` gets one from this, on the database's
+    /// clock as the insert runs; a queued or delayed one gets it when a dequeue claims it.
     pub timeout: Option<Duration>,
     /// Absolute expiry, when the parent already fixed one.
     ///
     /// Distinct from `timeout` because a child inherits its parent's deadline rather than
-    /// restarting the clock.
+    /// restarting the clock. Kept as given, whatever `timeout` says.
     pub deadline: Option<Timestamp>,
 
     /// The executor claiming this workflow.
@@ -608,15 +673,11 @@ impl<'a> NewWorkflow<'a> {
                 });
             }
         }
-        // Java rejects a zero or negative duration outright; `Duration` already rules out
-        // negatives, so only zero is left to catch. A zero delay is a caller that meant `None`,
-        // and a zero timeout would expire the workflow before it ran.
+        // `Duration` already rules out negatives, so zero and a value too long to store are what
+        // is left; `validate_positive_duration` says why each is refused.
         for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
-            if value == Some(Duration::ZERO) {
-                return Err(Error::InvalidInput {
-                    field: field.into(),
-                    detail: "must be a positive, non-zero duration".to_owned(),
-                });
+            if let Some(value) = value {
+                validate_positive_duration(field, value)?;
             }
         }
         validate_attributes(self.attributes)?;
@@ -783,6 +844,116 @@ mod tests {
         assert_eq!(duration_from_secs(1e300), None);
     }
 
+    /// A duration converts while its milliseconds fit an `i64`, and is refused one past that.
+    #[test]
+    fn a_duration_converts_to_milliseconds_only_while_it_fits() {
+        let largest = Duration::from_millis(i64::MAX as u64);
+        assert_eq!(duration_to_ms("timeout", largest).unwrap(), i64::MAX);
+        assert_eq!(duration_to_ms("timeout", Duration::ZERO).unwrap(), 0);
+        // Sub-millisecond precision is dropped, as the column cannot hold it, and is not what
+        // pushes a value over.
+        let largest_with_spare_nanos = largest + Duration::from_nanos(999_999);
+        assert_eq!(
+            duration_to_ms("timeout", largest_with_spare_nanos).unwrap(),
+            i64::MAX
+        );
+
+        for refused in [largest + Duration::from_millis(1), Duration::MAX] {
+            match duration_to_ms("timeout", refused) {
+                Err(Error::InvalidInput { field, detail }) => {
+                    assert_eq!(field, "timeout");
+                    assert_eq!(detail, "must fit in milliseconds as a 64-bit integer");
+                }
+                other => panic!("{refused:?} should have been refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// An instant plus a caller's duration is refused, not wrapped, past the largest instant.
+    #[test]
+    fn an_instant_past_the_largest_is_refused_not_wrapped() {
+        let start = Timestamp::from_epoch_ms(1_700_000_000_000);
+        assert_eq!(
+            start.try_add("delay", Duration::from_secs(1)).unwrap(),
+            Timestamp::from_epoch_ms(1_700_000_001_000)
+        );
+        let room = Duration::from_millis((i64::MAX - start.as_epoch_ms()) as u64);
+        assert_eq!(
+            start.try_add("delay", room).unwrap(),
+            Timestamp::from_epoch_ms(i64::MAX)
+        );
+
+        // Fits in milliseconds on its own, and still overflows the sum.
+        let over = room + Duration::from_millis(1);
+        assert!(matches!(
+            start.try_add("delay", over),
+            Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+        ));
+        // Does not fit at all.
+        assert!(matches!(
+            start.try_add("duration", Duration::MAX),
+            Err(Error::InvalidInput { ref field, .. }) if field == "duration"
+        ));
+    }
+
+    /// A relative delay resolves against `now`, and one that cannot be stored is reported.
+    #[test]
+    fn a_relative_delay_that_cannot_be_stored_does_not_resolve() {
+        let now = Timestamp::from_epoch_ms(1_700_000_000_000);
+        assert_eq!(
+            WorkflowDelay::For(Duration::from_secs(60))
+                .resolve(now)
+                .unwrap(),
+            Timestamp::from_epoch_ms(1_700_000_060_000)
+        );
+        // An absolute instant is taken as given, whatever `now` is.
+        let until = Timestamp::from_epoch_ms(i64::MAX);
+        assert_eq!(WorkflowDelay::Until(until).resolve(now).unwrap(), until);
+
+        for refused in [
+            Duration::MAX,
+            Duration::from_millis((i64::MAX - now.as_epoch_ms()) as u64 + 1),
+        ] {
+            assert!(
+                matches!(
+                    WorkflowDelay::For(refused).resolve(now),
+                    Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+                ),
+                "{refused:?} should not resolve"
+            );
+        }
+    }
+
+    /// A workflow's timeout and delay are refused by validation when they cannot be stored, so
+    /// the refusal comes before anything is written.
+    #[test]
+    fn an_oversized_workflow_timeout_or_delay_does_not_validate() {
+        let fits = NewWorkflow {
+            delay: Some(Duration::from_millis(i64::MAX as u64)),
+            timeout: Some(Duration::from_millis(i64::MAX as u64)),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(fits.validate().is_ok());
+
+        let timeout = NewWorkflow {
+            timeout: Some(Duration::MAX),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(matches!(
+            timeout.validate(),
+            Err(Error::InvalidInput { ref field, .. }) if field == "timeout"
+        ));
+        let delay = NewWorkflow {
+            queue_name: Some("q"),
+            delay: Some(Duration::MAX),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(matches!(
+            delay.validate(),
+            Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+        ));
+    }
+
     /// Both readers accept zero, and for the same reason.
     ///
     /// Zero is a legitimate stored value — these read what a column holds, and rejecting it
@@ -859,9 +1030,9 @@ mod tests {
 /// later tidy-up that sees an empty list and a missing one as the same thing.
 ///
 /// Unclaimed rows are matched in every case: they belong to no application, so they belong to all
-/// of them. See [`Applications::Named`] for the one exception that is not.
+/// of them. See [`AppScope::Named`] for the one exception that is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Applications<'a> {
+pub enum AppScope<'a> {
     /// Let the query decide, which is what a caller who has not thought about it wants.
     ///
     /// A **search** scopes to the handle's own application: listing workflows without saying whose
@@ -874,7 +1045,7 @@ pub enum Applications<'a> {
     Any,
     /// These applications, plus the unclaimed rows.
     ///
-    /// An empty list is [`Applications::Any`] rather than "no applications": there is no useful
+    /// An empty list is [`AppScope::Any`] rather than "no applications": there is no useful
     /// query for rows belonging to none of the applications you named, and reading it as a
     /// narrowing would make an unfiltered UI silently show nothing.
     Named(Vec<&'a str>),
@@ -886,7 +1057,7 @@ pub enum Applications<'a> {
 /// `WorkflowFilter::default()` lists everything. List fields match any of their entries and are
 /// ignored when empty; `Option<bool>` fields are three-valued, where `None` does not filter.
 ///
-/// [`applications`](Self::applications) is the exception, and deliberately so: its default scopes
+/// [`app_scope`](Self::app_scope) is the exception, and deliberately so: its default scopes
 /// to the caller's own application rather than to everything.
 ///
 /// The set is the union of all four implementations, which do not agree on it: each carries a
@@ -897,7 +1068,7 @@ pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
     ///
     /// Supplying any makes this an id-keyed read, which changes what
-    /// [`applications`](Self::applications) defaults to — see [`Applications::Unset`].
+    /// [`app_scope`](Self::app_scope) defaults to — see [`AppScope::Unset`].
     pub workflow_ids: Vec<&'a str>,
     /// Workflow ids starting with any of these.
     ///
@@ -906,7 +1077,7 @@ pub struct WorkflowFilter<'a> {
     pub workflow_id_prefixes: Vec<&'a str>,
 
     /// Whose workflows to list. Defaults to the caller's own application plus unclaimed ones.
-    pub applications: Applications<'a>,
+    pub app_scope: AppScope<'a>,
 
     /// Registered function names.
     pub names: Vec<&'a str>,
@@ -918,7 +1089,7 @@ pub struct WorkflowFilter<'a> {
     pub status: Vec<WorkflowStatus>,
 
     /// Application versions.
-    pub application_versions: Vec<&'a str>,
+    pub app_versions: Vec<&'a str>,
     /// Executors that claimed the workflow.
     pub executor_ids: Vec<&'a str>,
     /// Authenticated principals at submission.
@@ -1000,12 +1171,12 @@ impl Default for WorkflowFilter<'_> {
         Self {
             workflow_ids: Vec::new(),
             workflow_id_prefixes: Vec::new(),
-            applications: Applications::Unset,
+            app_scope: AppScope::Unset,
             names: Vec::new(),
             class_names: Vec::new(),
             config_names: Vec::new(),
             status: Vec::new(),
-            application_versions: Vec::new(),
+            app_versions: Vec::new(),
             executor_ids: Vec::new(),
             authenticated_users: Vec::new(),
             queue_names: Vec::new(),
@@ -1185,10 +1356,9 @@ pub enum AwaitedOutcome {
     Cancelled,
     /// It was recovered too many times and parked, so it has neither.
     ///
-    /// The limit it exceeded is not stored — `max_recovery_attempts` is an input to
-    /// [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) rather than a column — so
-    /// the count is what can be reported. Go reports `attempts - 2` as the limit, which is an
-    /// approximation of the same missing number.
+    /// The limit it exceeded is not stored — it is the engine's, applied when a dequeue dispatches
+    /// the workflow, rather than a column — so the count is what can be reported. Go reports
+    /// `attempts - 2` as the limit, which is an approximation of the same missing number.
     Parked {
         /// Recovery attempts recorded against the workflow.
         recovery_attempts: i64,
@@ -1207,18 +1377,18 @@ pub struct StepTiming {
     ///
     /// Fixed before the write and **it must not move between retries of the same logical
     /// record**. On a duplicate insert the stored value is compared against this one: equal means
-    /// this caller's own write whose acknowledgement was lost, different means another execution
-    /// recorded the step first. Re-stamping the clock per attempt would turn every lost
-    /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
-    /// than building it at the call site inside a retry loop.
+    /// this caller's own write whose acknowledgement was lost, different means this execution
+    /// recorded the step already, which is nondeterminism. Re-stamping the clock per attempt
+    /// would turn every lost acknowledgement into a spurious conflict — so hold the `StepTiming`
+    /// in a variable rather than building it at the call site inside a retry loop.
     ///
     /// **A step whose every attempt checks for it before writing is the exception**, and the
     /// internal step runners are the ones that do: a record acknowledged to nobody — a success
     /// committed with the work, or a failure recorded after the work rolled back — is caught by
-    /// the check on the next attempt and replayed, so it never reaches the insert. Only a genuine
-    /// rival survives to be compared there, and a completion that differs from this attempt's is
-    /// the right answer rather than a spurious one — which is why those paths stamp the clock
-    /// after their work rather than before it.
+    /// the check on the next attempt and replayed, so it never reaches the insert. Nothing that
+    /// reaches the comparison there is a lost acknowledgement, so a completion that differs from
+    /// this attempt's is the right answer rather than a spurious one — which is why those paths
+    /// stamp the clock after their work rather than before it.
     ///
     /// Omitting the timing altogether gives up that detection: with no recorded completion there
     /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
@@ -1272,41 +1442,16 @@ pub enum WorkflowDelay {
 
 impl WorkflowDelay {
     /// The instant this delay expires, resolved against `now` if it is relative.
-    pub(crate) fn resolve(self, now: Timestamp) -> Timestamp {
-        match self {
-            WorkflowDelay::For(d) => {
-                Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64)
-            }
-            WorkflowDelay::Until(t) => t,
-        }
-    }
-}
-
-/// Why a workflow is being submitted, which decides whether it may claim a row someone holds.
-///
-/// Java models this as two booleans, `isRecoveryRequest` and `isDequeuedRequest`, but **no call
-/// site sets both** — its dispatcher branches on one or the other, never the pair. A three-way
-/// choice is what it has always been, and naming it removes an unreadable pair of adjacent
-/// `bool` arguments that would compile just as happily swapped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Submission {
-    /// A first attempt, which does not claim a workflow another owner already holds.
-    #[default]
-    Fresh,
-    /// Recovering a workflow a dead executor left behind.
-    Recovery,
-    /// Dequeuing, which claims a workflow that was enqueued.
-    Dequeue,
-}
-
-impl Submission {
-    /// Whether this submission is being told it owns the workflow.
     ///
-    /// Recovery and dequeue are kept apart because the references keep them apart, even though
-    /// both answer this the same way: both count against the recovery budget, and both may claim
-    /// a row another owner holds, which from a fresh start would be theft.
-    pub(crate) fn claims_ownership(self) -> bool {
-        matches!(self, Submission::Recovery | Submission::Dequeue)
+    /// [`Error::InvalidInput`] for a relative delay whose instant cannot be stored. Fallible
+    /// rather than left to a validation upstream, because no check made without `now` can rule
+    /// that out: a delay that fits in milliseconds can still carry `now` past `i64::MAX`, and
+    /// only the resolution knows which `now` it is.
+    pub(crate) fn resolve(self, now: Timestamp) -> Result<Timestamp, Error> {
+        match self {
+            WorkflowDelay::For(d) => now.try_add("delay", d),
+            WorkflowDelay::Until(t) => Ok(t),
+        }
     }
 }
 
@@ -1315,11 +1460,45 @@ impl Submission {
 pub enum OutcomeWrite {
     /// This process recorded the outcome.
     Recorded,
-    /// Another process got there first, and the row is already terminal.
+    /// Another execution got there first, and the row is already terminal, or this execution no
+    /// longer owns the workflow.
     ///
     /// Not an error: the caller has lost a race it was allowed to lose, and should adopt the
     /// recorded outcome rather than overwrite it.
     AlreadyFinished,
+}
+
+/// A reading of the system database's clock, carried forward by this process's monotonic clock.
+///
+/// Workflow deadlines are set and compared on the database's clock, which every executor sharing
+/// the database shares. A wait for one is measured from a reading of that clock on
+/// [`Instant`], which no setting of this host's wall clock moves, so a host whose clock is far off
+/// the database's waits exactly as long as one whose clock agrees.
+///
+/// The reading is the database's clock as the statement that returns it runs, paired with the
+/// moment its row arrives here, so it misses the trip back: a wait measured from it ends that
+/// much late, never early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseTime {
+    epoch_ms: i64,
+    read_at: Instant,
+}
+
+impl DatabaseTime {
+    /// A reading of `epoch_ms`, taken now.
+    pub fn read(epoch_ms: i64) -> Self {
+        Self {
+            epoch_ms,
+            read_at: Instant::now(),
+        }
+    }
+
+    /// When, on this process's monotonic clock, the database's clock reaches `instant`: the
+    /// moment of the reading for an instant already behind it.
+    pub fn reaches(self, instant: Timestamp) -> Instant {
+        let ahead = instant.as_epoch_ms().saturating_sub(self.epoch_ms);
+        self.read_at + Duration::from_millis(u64::try_from(ahead).unwrap_or(0))
+    }
 }
 
 /// What the database said about a workflow after initialising it.
@@ -1327,31 +1506,32 @@ pub enum OutcomeWrite {
 pub struct WorkflowInitResult {
     /// The stored status, which is the existing one when the row was already there.
     pub status: WorkflowStatus,
-    /// Recovery attempts recorded against the workflow, after this one.
+    /// Recovery attempts recorded against the workflow.
     pub recovery_attempts: i64,
     /// The workflow's absolute expiry, as the database now holds it.
     ///
     /// Reported back because it may not be the one offered: a timeout is turned into a deadline
-    /// against the database layer's clock, and an existing row keeps the deadline it already had.
+    /// against the database's clock, and an existing row keeps the deadline it already had.
     pub deadline: Option<Timestamp>,
+    /// The database's clock as the same statement saw it, which is what a wait for `deadline` is
+    /// measured from.
+    pub clock: DatabaseTime,
     /// The serialization format actually stored.
     ///
     /// May differ from what the caller offered: the first writer decides the format, and every
     /// later attempt has to read the payloads that are actually there.
     pub serialization: Option<String>,
-    /// The input the row already held, where a fresh start is to run a row it did not create — one
-    /// no attempt owns: `Some(None)` for a row with no input, and `None` otherwise.
+    /// Whether this caller should go on to run the workflow: whether it created the row, by this
+    /// call or by an earlier attempt of it whose acknowledgement was lost.
     ///
-    /// Only the attempt that creates a row writes its input, so a fresh start that runs an existing
-    /// one offered an input the row does not hold. The row is what a recovery runs, so the run has
-    /// to start from this, not from what the caller offered. A recovery or a dequeue gets `None`:
-    /// it read the input with the row it claimed.
-    pub existing_input: Option<Option<String>>,
-    /// Whether this caller should go on to run the workflow.
-    ///
-    /// `false` means another owner holds it and this attempt is not a recovery — so the row is
-    /// recorded, but running it would be a second execution.
+    /// `false` means another caller created it, so the row is recorded but running it would be a
+    /// second execution. The caller joins it instead, whatever has become of the row.
     pub should_execute: bool,
+    /// This call's creator token, which the row holds as `creator_xid` when `should_execute`.
+    ///
+    /// A row inserted `PENDING` is owned by its creator from the start, so this is also the
+    /// `owner_xid` the execution that runs it holds, and presents on every write it makes.
+    pub creator_xid: String,
 }
 
 /// Whether a name is usable as an application name.
@@ -1435,6 +1615,99 @@ pub struct ApplicationRowCounts {
     pub workflows: u64,
     /// Recorded steps.
     pub steps: u64,
+}
+
+/// How long a system-database connection may sit idle inside an open transaction before the
+/// server ends its session, as `idle_in_transaction_session_timeout`.
+///
+/// A process that stalls mid-transaction (a frozen container, a network partition) would otherwise
+/// hold the transaction's row locks, and the connection, for as long as the stall lasts.
+///
+/// **Connection options that already set the parameter keep their own** (the database URL's
+/// `options` parameter, or `PGOPTIONS`), whatever this says. Otherwise [`Default`](Self::Default)
+/// and [`After`](Self::After) replace the server's setting, one made with `ALTER ROLE` or
+/// `ALTER DATABASE` included, and [`ServerSetting`](Self::ServerSetting) leaves it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdleTransactionTimeout {
+    /// [`IdleTransactionTimeout::DEFAULT`], sixty seconds.
+    #[default]
+    Default,
+    /// Whatever the server is set to, which may be no timeout at all.
+    ServerSetting,
+    /// After this long: more than zero, and at most [`IdleTransactionTimeout::MAX`]. A positive
+    /// value under a millisecond is a millisecond, the server's unit.
+    After(Duration),
+}
+
+impl IdleTransactionTimeout {
+    /// What [`Default`](Self::Default) is.
+    pub const DEFAULT: Duration = Duration::from_secs(60);
+
+    /// The longest timeout the server takes: the parameter is a 32-bit count of milliseconds,
+    /// about 24.8 days.
+    pub const MAX: Duration = Duration::from_millis(i32::MAX as u64);
+
+    /// Rejects an [`After`](Self::After) the server can't take: zero, or longer than
+    /// [`MAX`](Self::MAX).
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        let detail = match self {
+            IdleTransactionTimeout::After(timeout) if timeout.is_zero() => {
+                "must be more than zero; `ServerSetting` leaves the server's setting".to_owned()
+            }
+            IdleTransactionTimeout::After(timeout) if *timeout > Self::MAX => {
+                format!("must be at most {:?}", Self::MAX)
+            }
+            _ => return Ok(()),
+        };
+        Err(Error::InvalidInput {
+            field: "idle_transaction_timeout".into(),
+            detail,
+        })
+    }
+
+    /// The timeout to set on a connection, in the server's milliseconds, or `None` to leave the
+    /// server's setting.
+    pub(crate) fn millis(self) -> Option<u128> {
+        match self {
+            IdleTransactionTimeout::Default => Some(Self::DEFAULT.as_millis()),
+            IdleTransactionTimeout::ServerSetting => None,
+            IdleTransactionTimeout::After(timeout) => Some(timeout.as_millis().max(1)),
+        }
+    }
+}
+
+/// How many polling reads may run at once against a system database's pool.
+///
+/// Every wait is a loop that re-queries the database, and each pass takes a connection. Uncapped,
+/// enough waiters empty the pool and starve the control plane — enqueue, dequeue, status writes,
+/// recovery, cancellation — leaving the waiters blocked on writes that can no longer happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PollingConcurrency {
+    /// Half the pool, and at least one. The half is what leaves the other half for the control
+    /// plane, and the minimum matters at `max_connections = 1`, where half is zero: a cap of zero
+    /// would not be a small budget but a permanent block.
+    #[default]
+    Default,
+    /// No cap.
+    Unlimited,
+    /// At most this many. Above the pool size is the caller's business: this caps polling, the
+    /// pool caps connections.
+    AtMost(std::num::NonZeroU32),
+}
+
+impl PollingConcurrency {
+    /// The permits a cap of this size takes, for a pool of `pool_size` connections.
+    ///
+    /// No cap is a permit count nothing will exhaust rather than an absent semaphore, so a handle
+    /// holds one unconditional [`Semaphore`](tokio::sync::Semaphore) with no branch on the acquire
+    /// path.
+    pub(crate) fn permits(self, pool_size: u32) -> usize {
+        match self {
+            PollingConcurrency::Default => usize::max((pool_size / 2) as usize, 1),
+            PollingConcurrency::Unlimited => tokio::sync::Semaphore::MAX_PERMITS,
+            PollingConcurrency::AtMost(n) => n.get() as usize,
+        }
+    }
 }
 
 /// How many workflows a queue may start per window.
@@ -1880,14 +2153,63 @@ pub enum OnExistingQueue {
     Leave,
 }
 
+/// What one claim from a queue took, and why it took nothing if it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dequeued {
+    /// The workflows this claim started, in dequeue order.
+    pub workflow_ids: Vec<String>,
+    /// The limit that left this claim no room, when one did.
+    ///
+    /// Set only when the claim returned before selecting anything, so `workflow_ids` is then
+    /// empty. `None` with nothing claimed means no row was eligible, or a peer took them first.
+    pub stopped_by: Option<DequeueStop>,
+}
+
+/// The limit that left a claim no room to start anything.
+///
+/// Each is the first limit, in the order the claim checks them, whose remaining room came to zero:
+/// worker concurrency, then the rate limits, then the concurrency limits, the queue-wide one ahead
+/// of the per-partition one at each step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueStop {
+    /// This process is already running as many of the queue's workflows as it may.
+    WorkerConcurrency,
+    /// This process is already running as many of the partition's workflows as it may.
+    PartitionWorkerConcurrency,
+    /// The queue's rate-limit window is full.
+    RateLimit,
+    /// The partition's rate-limit window is full.
+    PartitionRateLimit,
+    /// The queue already has as many workflows `PENDING` as its concurrency allows.
+    Concurrency,
+    /// The partition already has as many workflows `PENDING` as its concurrency allows.
+    PartitionConcurrency,
+}
+
+impl DequeueStop {
+    /// Whether the limit is counted across the whole queue, whichever partition was claimed from.
+    ///
+    /// Such a limit leaves every other partition just as full, so a caller walking the partitions
+    /// one at a time can end the walk on it rather than paying a claim per partition to learn the
+    /// same thing. A per-partition limit says nothing about the next key.
+    pub fn spans_partitions(self) -> bool {
+        match self {
+            Self::WorkerConcurrency | Self::RateLimit | Self::Concurrency => true,
+            Self::PartitionWorkerConcurrency
+            | Self::PartitionRateLimit
+            | Self::PartitionConcurrency => false,
+        }
+    }
+}
+
 /// A registered version of the application.
 ///
 /// The registry is what lets a firing schedule stamp the *latest* version, so only executors
-/// running that code dequeue it, and what `application_version` on a workflow row refers to.
+/// running that code dequeue it, and what [`WorkflowRecord::app_version`] refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
     /// The application that registered this version, or `None` if it is unclaimed.
-    pub application_name: Option<String>,
+    pub app_name: Option<String>,
     /// Generated identity, distinct from the name.
     pub version_id: String,
     /// The version as the application names it — the value stored on workflow rows.
@@ -1950,6 +2272,92 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
     fn decode(&self, value: &str, serialization: Option<&str>) -> Result<serde_json::Value, Error>;
 }
 
+/// Encodes a value to record as a step's output or error, through the caller's codec. `what` names
+/// the value for the failure message: `an output` or `an error`. The reverse of
+/// [`decode_step_value`].
+///
+/// Every value this crate records through a [`StepCodec`] goes through here (a management call's
+/// result, an internal step's output, a recorded system-database error), so a replay reads them all
+/// back the same way. An ordinary step's output and error are the application's own types, and go
+/// through the payload encoding instead.
+///
+/// `serde_json` fails only on a type that cannot be JSON, such as a non-string map key, and turns a
+/// non-finite float into `null` without failing, so a value here must hold none; every value this
+/// takes is one of the engine's own plain records or an [`Error`]. The codec can fail too, since a
+/// custom serializer may fail for its own reasons.
+pub(crate) fn encode_step_value<T: serde::Serialize + ?Sized>(
+    value: &T,
+    codec: &dyn StepCodec,
+    what: &str,
+) -> Result<EncodedValue, Error> {
+    let value = serde_json::to_value(value)
+        .map_err(|e| Error::Malformed(format!("{what} to record is not JSON: {e}")))?;
+    codec.encode(value)
+}
+
+/// Reads one of `step`'s recorded values back through the caller's codec, by the tag the row was
+/// stored under, and says which step it came from if it cannot. `what` names the value for that
+/// message: `an error` or `an output`.
+///
+/// The codec and serde don't know which step they are reading, so a failure gets that here:
+///
+/// - [`Error::UnknownSerialization`] is returned as it is, because callers match on it and it names
+///   only the tag. The step that holds it is logged instead.
+/// - [`Error::Malformed`] gets the step in its message.
+/// - Any other error, such as one a custom serializer's decode returns, is returned unchanged.
+pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
+    step: &StepRecord,
+    recorded: &str,
+    caller: StepCaller<'_>,
+    step_name: &str,
+    what: &str,
+) -> Result<T, Error> {
+    let StepCaller {
+        workflow_id,
+        step_id,
+        codec,
+        ..
+    } = caller;
+    codec
+        .decode(recorded, step.serialization.as_deref())
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
+        })
+        .map_err(|error| match error {
+            Error::UnknownSerialization { ref name } => {
+                tracing::warn!(
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    serialization = %name,
+                    "a recorded step holds {what} under a serialization this process cannot read"
+                );
+                error
+            }
+            Error::Malformed(detail) => Error::Malformed(format!(
+                "workflow {workflow_id} step {step_id} ({step_name}) has {what} this build cannot \
+                 read: {detail}"
+            )),
+            other => other,
+        })
+}
+
+/// The execution a write is made by: the workflow it runs, and the token it owns it by.
+///
+/// A write that carries one lands only while the workflow's row still holds that token, checked
+/// in the write's own transaction before anything else and locking the row until it commits. Once
+/// the workflow has been handed to another execution (a cancel, a resume, a recovery), the write
+/// is refused with [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict) and rolls back.
+/// `None` where a method takes an `Option<WorkflowOwner>` is a caller that is not an execution, a
+/// client say, and is not checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowOwner<'a> {
+    /// The workflow the execution runs.
+    pub workflow_id: &'a str,
+    /// The token it owns the workflow by.
+    pub owner_xid: &'a str,
+}
+
 /// The workflow step a management call runs as, and how its result is recorded.
 ///
 /// What the methods that record their own result take, where the plain-id methods take `caller:
@@ -1966,6 +2374,19 @@ pub struct StepCaller<'a> {
     pub step_id: i32,
     /// How the recorded result is encoded and decoded.
     pub codec: &'a dyn StepCodec,
+    /// The token the calling execution owns its workflow by: the call and its record land only
+    /// while the workflow is still that execution's.
+    pub owner_xid: &'a str,
+}
+
+impl<'a> StepCaller<'a> {
+    /// The execution making the call, which the call is checked against.
+    pub fn owner(&self) -> WorkflowOwner<'a> {
+        WorkflowOwner {
+            workflow_id: self.workflow_id,
+            owner_xid: self.owner_xid,
+        }
+    }
 }
 
 /// The workflow a [`get_event`](crate::sysdb::SystemDatabase::get_event) runs on behalf of, and the
@@ -1997,6 +2418,8 @@ pub struct GetEventCaller<'a> {
     /// start the timeout again — a read that waited fifty of its sixty seconds and crashed has ten
     /// left.
     pub timeout_step_id: i32,
+    /// The token the reading execution owns its workflow by, which both records present.
+    pub owner_xid: &'a str,
 }
 
 /// The workflow an [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) creates a child
@@ -2035,6 +2458,9 @@ pub struct InitWorkflowCaller<'a> {
     /// When the start began, for the row's `started_at`. The completion is stamped by the write
     /// itself, since the step spans the launch alone.
     pub started_at: Timestamp,
+    /// The token the parent's execution owns it by. The child is created, and the start
+    /// recorded, only while the parent is still that execution's: a stale parent starts nothing.
+    pub owner_xid: &'a str,
 }
 
 /// An encoded payload and the format it is encoded in.
@@ -2127,35 +2553,30 @@ pub struct StreamRecord {
 
 /// One workflow to fork, and where its fork picks up.
 ///
-/// A struct per fork rather than three parallel lists. Python takes `original_workflow_ids`,
-/// `forked_workflow_ids` and `start_steps` and raises when their lengths disagree; pairing them
-/// here means they cannot.
+/// A struct per fork rather than three parallel lists, so the original, its fork's id and its
+/// start step cannot disagree in length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fork<'a> {
     /// The workflow to fork from. It is not modified beyond being marked as forked from.
-    pub source_id: &'a str,
+    pub original_id: &'a str,
     /// The id the fork gets, or `None` to have one generated.
     ///
-    /// Optional because Go and TypeScript both generate one when the caller does not care, and
-    /// the generated ids come back from [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    /// The generated ids come back from
+    /// [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
     pub forked_id: Option<&'a str>,
     /// The first step the fork will run.
     ///
     /// Every step *below* this is copied to the fork, so it replays them instead of running them.
     /// Steps are numbered from zero, so `0` copies nothing and restarts the workflow from the
     /// beginning, and `1` carries step 0 across.
-    ///
-    /// That last case is where the references disagree: TypeScript copies for any
-    /// `start_step > 0` and Python only for `step > 1`, so a Python fork from step 1 re-runs the
-    /// step it was given the result of. This follows TypeScript.
     pub start_step: i32,
 }
 
 impl<'a> Fork<'a> {
-    /// A fork of `source_id` restarting from the beginning, with a generated id.
-    pub fn new(source_id: &'a str) -> Self {
+    /// A fork of `original_id` restarting from the beginning, with a generated id.
+    pub fn new(original_id: &'a str) -> Self {
         Self {
-            source_id,
+            original_id,
             forked_id: None,
             start_step: 0,
         }
@@ -2163,9 +2584,9 @@ impl<'a> Fork<'a> {
 
     /// Rejects ids the schema cannot key on, matching [`NewWorkflow::validate`].
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.source_id.is_empty() {
+        if self.original_id.is_empty() {
             return Err(Error::InvalidInput {
-                field: "source_id".into(),
+                field: "original_id".into(),
                 detail: "must not be empty".to_owned(),
             });
         }
@@ -2266,11 +2687,8 @@ impl ForkOptions<'_> {
             }
         }
         // As on `NewWorkflow`: a zero timeout would expire the fork before it ran.
-        if self.timeout == Some(Duration::ZERO) {
-            return Err(Error::InvalidInput {
-                field: "timeout".into(),
-                detail: "must be absent rather than zero".to_owned(),
-            });
+        if let Some(timeout) = self.timeout {
+            validate_positive_duration("timeout", timeout)?;
         }
         // The replacements are applied by joining against them, so one child named twice would
         // match a copied step twice and duplicate it. The primary key would catch that as a
@@ -2278,11 +2696,18 @@ impl ForkOptions<'_> {
         // TypeScript build a `CASE` instead, which silently takes the first match — but two
         // replacements for one child is a caller that does not know which it wants, and picking
         // for them is worse than saying so.
-        for (index, (original, _)) in self.replacement_children.iter().enumerate() {
+        for (index, (original, replacement)) in self.replacement_children.iter().enumerate() {
             if original.is_empty() {
                 return Err(Error::InvalidInput {
                     field: "replacement_children".into(),
                     detail: "a replaced child id must not be empty".to_owned(),
+                });
+            }
+            // A fork rewritten to wait on `""` waits on a workflow that can never exist.
+            if replacement.is_empty() {
+                return Err(Error::InvalidInput {
+                    field: "replacement_children".into(),
+                    detail: format!("the replacement for {original} must not be empty"),
                 });
             }
             if self.replacement_children[..index]
@@ -2296,6 +2721,17 @@ impl ForkOptions<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The timeout in milliseconds, the unit its column stores.
+    ///
+    /// Refused rather than saturated, by [`duration_to_ms`]. [`validate`](Self::validate) is where
+    /// a caller hears it, through [`validate_positive_duration`]; the insert converts through here,
+    /// so the unit is written once.
+    pub(crate) fn timeout_ms(&self) -> Result<Option<i64>, Error> {
+        self.timeout
+            .map(|timeout| duration_to_ms("timeout", timeout))
+            .transpose()
     }
 }
 
@@ -2361,6 +2797,14 @@ impl RewindOptions<'_> {
 pub mod step_names {
     /// The step name `record_sleep` records.
     pub const SLEEP: &str = "DBOS.sleep";
+
+    /// What a patch marker's step name starts with: the marker for the patch named `v2` is
+    /// recorded as `DBOS.patch-v2`.
+    ///
+    /// A marker records that an execution took a [`patch`](crate::patch())'s new path. It is a
+    /// row with this name and nothing else — no output, no error, no serialization — at the
+    /// position the patch was reached at, which is what a replay looks for there.
+    pub const PATCH_PREFIX: &str = "DBOS.patch-";
 
     /// The step names the two send methods record, one each: `send_message` writes [`SEND`] and
     /// `send_messages` writes [`SEND_BULK`]. The name is therefore the API surface the caller
@@ -2677,7 +3121,7 @@ impl ScheduleUpdate<'_> {
 
 /// Which schedules a listing returns.
 ///
-/// Every field narrows; an empty filter returns the table. `applications` takes the
+/// Every field narrows; an empty filter returns the table. `app_scope` takes the
 /// *observability* form — unset means the reading handle's own plus the unclaimed — because this
 /// is a search rather than an addressed read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2689,5 +3133,5 @@ pub struct ScheduleFilter<'a> {
     /// Only schedules whose name starts with one of these, or every name when empty.
     pub schedule_name_prefixes: Vec<&'a str>,
     /// Which applications' schedules to return.
-    pub applications: Applications<'a>,
+    pub app_scope: AppScope<'a>,
 }

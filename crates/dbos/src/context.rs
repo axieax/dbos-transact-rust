@@ -9,8 +9,9 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::instance::Executor;
@@ -189,6 +190,12 @@ static NEXT_STEP_MARKER: AtomicU64 = AtomicU64::new(0);
 /// The parts of a workflow that outlive any one call within it.
 struct WorkflowState {
     workflow_id: String,
+    /// The token this execution owns the workflow by, which every write it makes presents.
+    ///
+    /// A direct start's creator token, or the token of the dequeue claim that dispatched it. When
+    /// the workflow is handed to another execution (a cancel, a resume, a recovery), the row's
+    /// `owner_xid` stops matching this, and this execution's next write is refused.
+    owner_xid: String,
     /// When this workflow must stop, if it was given a budget.
     ///
     /// **The instant the database holds, not the timeout its caller offered.** A recovered
@@ -218,11 +225,77 @@ struct WorkflowState {
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
+    /// The child starts this workflow has in flight, which it waits for before recording its
+    /// outcome.
+    ///
+    /// **A start writes under this execution's owner token, and recording the outcome gives the
+    /// token up.** A start the body dropped part-way goes on in a task of its own, and if the
+    /// outcome landed first that task's write would be refused, with nobody left awaiting it to
+    /// hear so: the child would never exist, and nothing would record why. Waiting here is what
+    /// makes a dropped start keep its promise to start the child.
+    starts: Arc<Starts>,
 }
 
 impl WorkflowState {
     fn next_step_id(&self) -> i32 {
         self.next_step_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn peek_step_id(&self) -> i32 {
+        self.next_step_id.load(Ordering::Relaxed)
+    }
+
+    fn claim_step_id(&self, step_id: i32) -> bool {
+        self.next_step_id
+            .compare_exchange(step_id, step_id + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+/// A count of the child starts a workflow has in flight, and a way to wait until there are none.
+///
+/// A start holds a [`StartToken`] for as long as its task exists, and the execution waits on
+/// [`drained`](Self::drained) once its body has ended. Built from an atomic and a
+/// [`tokio::sync::Notify`] alone, which need no particular runtime to run on.
+#[derive(Debug, Default)]
+pub(crate) struct Starts {
+    in_flight: AtomicUsize,
+    none_left: Notify,
+}
+
+impl Starts {
+    /// Counts one more start in flight, until the token is dropped.
+    pub(crate) fn token(self: &Arc<Self>) -> StartToken {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        StartToken(Arc::clone(self))
+    }
+
+    /// Returns once no start is in flight: at once if none is.
+    ///
+    /// Registers for the wake-up before reading the count, so a last token dropped between the
+    /// read and the await still wakes it.
+    pub(crate) async fn drained(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.none_left.notified());
+            notified.as_mut().enable();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One start in flight, counted in its workflow's [`Starts`] until this is dropped — however the
+/// task holding it ends.
+#[derive(Debug)]
+pub(crate) struct StartToken(Arc<Starts>);
+
+impl Drop for StartToken {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.none_left.notify_waiters();
+        }
     }
 }
 
@@ -231,6 +304,7 @@ impl Ctx {
     pub(crate) fn new(
         executor: Arc<Executor>,
         workflow_id: impl Into<String>,
+        owner_xid: impl Into<String>,
         deadline: Option<Timestamp>,
         encoding: PayloadEncoding,
     ) -> Self {
@@ -238,9 +312,11 @@ impl Ctx {
             executor,
             workflow: Arc::new(WorkflowState {
                 workflow_id: workflow_id.into(),
+                owner_xid: owner_xid.into(),
                 deadline,
                 encoding,
                 next_step_id: AtomicI32::new(0),
+                starts: Arc::default(),
             }),
             step: None,
         }
@@ -282,6 +358,19 @@ impl Ctx {
         &self.workflow.workflow_id
     }
 
+    /// The token this execution owns its workflow by, which every write it makes presents.
+    pub(crate) fn owner_xid(&self) -> &str {
+        &self.workflow.owner_xid
+    }
+
+    /// This execution, as the writes it makes present it.
+    pub(crate) fn owner(&self) -> crate::sysdb::types::WorkflowOwner<'_> {
+        crate::sysdb::types::WorkflowOwner {
+            workflow_id: self.workflow_id(),
+            owner_xid: self.owner_xid(),
+        }
+    }
+
     /// The id of the step body this context is inside, or `None` in the workflow proper.
     pub(crate) fn step_id(&self) -> Option<i32> {
         self.step.as_ref().map(|step| step.status.step_id)
@@ -307,6 +396,12 @@ impl Ctx {
     /// the caller did not already have.
     pub(crate) fn is_same_execution(&self, other: &Ctx) -> bool {
         Arc::ptr_eq(&self.workflow, &other.workflow)
+    }
+
+    /// The child starts this workflow has in flight. A start holds a token from it for as long as
+    /// its task exists, and the execution waits for them all before recording its outcome.
+    pub(crate) fn starts(&self) -> &Arc<Starts> {
+        &self.workflow.starts
     }
 
     /// When this workflow must stop, if it has a deadline at all.
@@ -335,6 +430,24 @@ impl Ctx {
     /// The next step id in this workflow, zero-based and never reused.
     pub(crate) fn next_step_id(&self) -> i32 {
         self.workflow.next_step_id()
+    }
+
+    /// The id the next call will take, without taking it.
+    ///
+    /// For a call that has to look at a position before deciding whether to occupy it — a
+    /// [`patch`](crate::patch()) — and that pairs this with [`claim_step_id`](Self::claim_step_id)
+    /// to learn whether anything else took the position while it looked.
+    pub(crate) fn peek_step_id(&self) -> i32 {
+        self.workflow.peek_step_id()
+    }
+
+    /// Takes `step_id` if it is still the next id, and reports whether it was.
+    ///
+    /// One compare-and-swap, so the check and the take are a single step: `false` means some other
+    /// call of this execution took an id since `step_id` was [peeked](Self::peek_step_id), and the
+    /// counter is left as that call left it.
+    pub(crate) fn claim_step_id(&self, step_id: i32) -> bool {
+        self.workflow.claim_step_id(step_id)
     }
 
     /// The executor running this workflow.
@@ -581,9 +694,27 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
+/// The owner token the crate's unit tests run their contexts under. A test that writes against a
+/// workflow row makes the row's `owner_xid` this, as a start or a claim would.
+#[cfg(test)]
+pub(crate) const TEST_OWNER: &str = "test-owner";
+
+/// Makes [`TEST_OWNER`] the owner of `workflow_id`'s row, as a start or a claim would make its own
+/// token.
+#[cfg(test)]
+pub(crate) async fn own_for_test(db: &dbos_test_support::TestDatabase, workflow_id: &str) {
+    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = $1 WHERE workflow_uuid = $2"#)
+        .bind(TEST_OWNER)
+        .bind(workflow_id)
+        .execute(&db.pool().await)
+        .await
+        .expect("could not take ownership of the workflow row");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// The step counter is the half of the context that needs no executor, so it is tested on
     /// `WorkflowState` directly. The scoping tests below need a real `Ctx`, so they launch against
@@ -591,10 +722,63 @@ mod tests {
     fn state() -> WorkflowState {
         WorkflowState {
             workflow_id: "wf-1".to_owned(),
+            owner_xid: TEST_OWNER.to_owned(),
             deadline: None,
             encoding: PayloadEncoding::Native,
             next_step_id: AtomicI32::new(0),
+            starts: Arc::default(),
         }
+    }
+
+    /// With no start in flight, the wait is over at once.
+    #[tokio::test]
+    async fn no_starts_in_flight_drains_at_once() {
+        let starts = Arc::new(Starts::default());
+        tokio::time::timeout(Duration::from_secs(1), starts.drained())
+            .await
+            .expect("nothing was in flight");
+    }
+
+    /// The wait lasts until the last token is dropped, and not past it.
+    #[tokio::test]
+    async fn drained_waits_for_the_last_start() {
+        let starts = Arc::new(Starts::default());
+        let first = starts.token();
+        let second = starts.token();
+
+        let mut drained = std::pin::pin!(starts.drained());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), drained.as_mut())
+                .await
+                .is_err(),
+            "drained with two starts in flight"
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), drained.as_mut())
+                .await
+                .is_err(),
+            "drained with one start still in flight"
+        );
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), drained)
+            .await
+            .expect("the last start was dropped");
+    }
+
+    /// A token dropped by another task while the wait is parked wakes it.
+    #[tokio::test]
+    async fn a_token_dropped_elsewhere_wakes_the_wait() {
+        let starts = Arc::new(Starts::default());
+        let token = starts.token();
+        let dropper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(token);
+        });
+        tokio::time::timeout(Duration::from_secs(1), starts.drained())
+            .await
+            .expect("the token was dropped");
+        dropper.await.unwrap();
     }
 
     #[test]
@@ -657,6 +841,7 @@ mod tests {
         let ctx = Ctx::new(
             dbos.executor("test").expect("launched"),
             workflow_id,
+            crate::context::TEST_OWNER,
             deadline,
             PayloadEncoding::Native,
         );
